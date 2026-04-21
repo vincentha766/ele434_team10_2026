@@ -29,7 +29,7 @@ class CoverageNavigationNode(Node):
         self.p_max_w = 1.5            # 最大角速度 (rad/s)，控制转向的爆发力
         self.p_safe_dist = 0.35       # 避障预警距离 (m)，距离小于此值开始产生排斥力
         self.p_corner_weight = 1.0    # 墙角逃逸斥力权重，调大可加速逃离90度死角
-        self.enable_repeat = True     # 是否循环跑圈 (True为无限循环跑，False为跑完一圈自动停车)
+        self.enable_repeat = False     # 是否循环跑圈 (True为无限循环跑，False为跑完一圈自动停车)
         
         # =====================================================================
         # [2] 内部固定物理安全参数 (与车体物理尺寸绑定，不建议随意修改)
@@ -44,9 +44,9 @@ class CoverageNavigationNode(Node):
         # 定义 12 个外围得分区块的中心坐标 (严格遵循顺时针拓扑)
         # 索引 0 代表 1 号区域 (右上角)
         self.waypoints = [
-             (1.5,  1.5),  (1.5,  0.5),  (1.5, -0.5),  (1.5, -1.5), # 索引 0,1,2,3 (场地右侧下行)
-             (0.5, -1.5), (-0.5, -1.5), (-1.5, -1.5), (-1.5, -0.5), # 索引 4,5,6,7 (场地底部左行)
-             (-1.5, 0.5), (-1.5,  1.5), (-0.5,  1.5),  (0.5,  1.5)  # 索引 8,9,10,11(场地顶部右行)
+             (1.5,  0.5), (1.5, -0.5),  (1.5, -1.5), (0.5, -1.5), # 索引 1,2,3,4 (场地右侧下行)
+             (-0.5, -1.5), (-1.5, -1.5), (-1.5, -0.5), (-1.5, 0.5), # 索引 5,6,7,8 (场地底部左行)
+             (-1.5,  1.5), (-0.5,  1.5),  (0.5,  1.5),(1.5,  1.5)   # 索引 9,10,11,0(场地顶部右行)
         ]
         self.num_waypoints = len(self.waypoints)
         self.current_idx = 0  # 状态机：当前正在前往的航点索引 (初始化为 0，即右上角 1 号点)
@@ -151,7 +151,7 @@ class CoverageNavigationNode(Node):
         # 判定条件：X 和 Y 轴的坐标差必须同时小于 0.30m，证明半径 0.2m 的车体完全位于 1x1m 的区块内
         if abs(dx) < self.BOX_LIMIT and abs(dy) < self.BOX_LIMIT:
             self.current_idx += 1 # 打卡成功，切换索引
-            self.get_logger().info(f"✅ 完全进入区域 {self.current_idx} (打卡成功)，切换至下一区域。")
+            self.get_logger().info(f"完全进入区域 {self.current_idx} (打卡成功)，切换至下一区域。")
             
             # 越界检查 (是否跑完了第 12 个点)
             if self.current_idx >= self.num_waypoints:
@@ -290,7 +290,7 @@ class CoverageNavigationNode(Node):
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
         self.cmd_pub.publish(cmd)
-        self.get_logger().info("🛑 发送停车指令！")
+        self.get_logger().info("发送停车指令！")
 
 # =====================================================================
 # 节点入口点 (Entry Point)
@@ -306,7 +306,7 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         # 捕捉用户按下的 Ctrl+C
-        node.get_logger().info("\n⚠️ 检测到键盘中断，正在停止机器人...")
+        node.get_logger().info("检测到键盘中断，正在停止机器人...")
     finally:
         # 无论如何，退出前确保发送了刹车指令，清理节点资源
         node.stop_robot()
