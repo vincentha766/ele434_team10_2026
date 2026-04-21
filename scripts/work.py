@@ -88,8 +88,8 @@ def main(args=None):
     node.create_subscription(LaserScan, '/scan', scan_callback, 10)
 
     # 3. 核心算法参数配置
-    p_max_v = 0.25           # 最高线速度 (m/s)
-    p_max_w = 1.5            # 最高角速度 (rad/s)
+    p_max_v = 0.26           # 最高线速度 (m/s)
+    p_max_w = 1.82            # 最高角速度 (rad/s)
     p_safe_dist = 0.35       # 避障预警距离: < 0.35m 时开始产生排斥力
     p_corner_weight = 1.0    # 墙角逃逸权重: 越大，被卡在死角时甩尾越猛烈
     enable_repeat = True     # 是否无限跑圈
