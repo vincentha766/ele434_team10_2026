@@ -25,7 +25,15 @@ install(PROGRAMS
   scripts/stop_me.py
   scripts/obstacle.py
   scripts/work.py
+  scripts/waypoint_manager.py
+  scripts/apf_controller.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install Launch files
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_package()
