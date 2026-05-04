@@ -8,8 +8,8 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    log_dir = os.path.join(os.getcwd(), 'robot_logs')
     use_monitor = LaunchConfiguration('use_monitor')
+    log_dir_arg = LaunchConfiguration('log_dir')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -17,11 +17,17 @@ def generate_launch_description():
             default_value='true',
             description='Whether to start robot_monitor node',
         ),
+        DeclareLaunchArgument(
+            'log_dir',
+            default_value=os.path.join(os.getcwd(), 'robot_logs'),
+            description='Directory to save robot logs',
+        ),
         Node(
             package='ele434_team10_2026',
             executable='obstacle.py',
             name='coverage_navigation_node',
             output='screen',
+            emulate_tty=True,
         ),
         Node(
             package='ele434_team10_2026',
@@ -30,7 +36,8 @@ def generate_launch_description():
             output='screen',
             condition=IfCondition(use_monitor),
             parameters=[
-                {'log_dir': log_dir},
+                {'log_dir': log_dir_arg},
             ],
+            emulate_tty=True,
         ),
     ])

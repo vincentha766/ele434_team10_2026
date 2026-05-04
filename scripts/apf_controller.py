@@ -6,6 +6,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import TwistStamped, Point
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 import math
 
 class APFController(Node):
@@ -34,6 +35,7 @@ class APFController(Node):
 
         # 3. 订阅者与发布者
         self.cmd_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        self.log_pub = self.create_publisher(String, '/avoidance_log', 10)
         self.create_subscription(Point, '/cmd_goal', self.goal_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
@@ -83,17 +85,24 @@ class APFController(Node):
         obs_nearest = min(min_f, min_fl, min_fr)
 
         # 3. 动态引力权重
+        active_branches = []
         track_weight = max(0.0, (obs_nearest - self.D_STOP) / (self.D_SAFE - self.D_STOP)) if obs_nearest < self.D_SAFE else 1.0
+        if track_weight < 1.0: active_branches.append(f"注意力衰减(w={track_weight:.2f})")
         omega_att = self.K_ATT * angle_error * track_weight
 
         # 4. 斥力分量
         omega_rep = 0.0
-        if min_fl < self.D_SAFE: omega_rep -= (self.D_SAFE - min_fl) * self.K_REP
-        if min_fr < self.D_SAFE: omega_rep += (self.D_SAFE - min_fr) * self.K_REP
+        if min_fl < self.D_SAFE: 
+            omega_rep -= (self.D_SAFE - min_fl) * self.K_REP
+            active_branches.append("左前斥力")
+        if min_fr < self.D_SAFE: 
+            omega_rep += (self.D_SAFE - min_fr) * self.K_REP
+            active_branches.append("右前斥力")
         
         # 打破正前死锁
         if min_f < self.D_SAFE and abs(min_fl - min_fr) < 0.1:
             omega_rep += 1.5 * (self.D_SAFE - min_f)
+            active_branches.append("正前破局")
 
         # 5. 速度合成
         final_w = max(min(omega_att + omega_rep, self.MAX_W), -self.MAX_W)
@@ -110,6 +119,12 @@ class APFController(Node):
         cmd.twist.linear.x = float(final_v)
         cmd.twist.angular.z = float(final_w)
         self.cmd_pub.publish(cmd)
+
+        # 发布逻辑状态
+        if active_branches:
+            log_msg = String()
+            log_msg.data = " | ".join(active_branches)
+            self.log_pub.publish(log_msg)
 
 def main(args=None):
     rclpy.init(args=args)

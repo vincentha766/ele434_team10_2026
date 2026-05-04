@@ -11,6 +11,7 @@ import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 
 
 class RobotMonitor(Node):
@@ -37,6 +38,7 @@ class RobotMonitor(Node):
         # 订阅话题
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(String, '/avoidance_log', self.avoidance_log_callback, 10)
         self.start_time = self.get_clock().now()
 
         # 初始化 CSV 文件
@@ -78,13 +80,22 @@ class RobotMonitor(Node):
             return
 
         new_min_dist = min(ranges)
-        # 简单的避障逻辑判定记录
-        if new_min_dist < 0.7 and new_min_dist < self.min_dist - 0.05:
+        # 简单的避障逻辑判定记录 (保留作为雷达直接触发的保底记录)
+        if new_min_dist < 0.5 and new_min_dist < self.min_dist - 0.05:
             t = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
             with open(self.logic_log_file, 'a') as f:
-                f.write(f'[{t:.2f}s] 警告: 发现障碍物，距离 {new_min_dist:.2f}m。触发避障逻辑。\n')
+                f.write(f'[{t:.2f}s] [雷达警告] 距离极近: {new_min_dist:.2f}m\n')
 
         self.min_dist = new_min_dist
+
+    def avoidance_log_callback(self, msg):
+        """
+        接收来自导航节点的详细避障状态
+        """
+        t = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        with open(self.logic_log_file, 'a') as f:
+            f.write(f'[{t:.2f}s] [避障逻辑] {msg.data}\n')
+        self.get_logger().info(f'[避障逻辑] {msg.data}')
 
     def finalize(self):
         self.get_logger().info('正在生成速度折线图...')

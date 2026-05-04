@@ -14,5 +14,6 @@ def generate_launch_description():
             parameters=[
                 {'log_dir': os.path.join(os.getcwd(), 'robot_logs')},
             ],
+            emulate_tty=True,
         )
     ])

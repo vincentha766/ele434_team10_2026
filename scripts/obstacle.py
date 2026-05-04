@@ -31,6 +31,7 @@ import rclpy
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 import math
 import time
 
@@ -100,6 +101,7 @@ def main(args=None):
     
     # 2. 声明发布者与订阅者
     cmd_pub = node.create_publisher(TwistStamped, '/cmd_vel', 10)
+    log_pub = node.create_publisher(String, '/avoidance_log', 10)
     node.create_subscription(Odometry, '/odom', odom_callback, 10)
     node.create_subscription(LaserScan, '/scan', scan_callback, 10)
 
@@ -214,6 +216,9 @@ def main(args=None):
             target_angle = math.atan2(dy, dx)
             angle_error = wrap_to_pi(target_angle - odom_yaw)
             
+            # 用于记录当前周期的所有激活逻辑，输出到 log_pub
+            active_log_branches = []
+
             # C.1 注意力转移机制 (动态引力衰减)
             # 等价于：离障碍越近，U_att 对总势能的影响越小，避免“既要赶去目标又要猛躲墙”打架。
             min_scan = min(min_f, min_fl, min_fr, min_l, min_r)
@@ -221,6 +226,7 @@ def main(args=None):
             if attention_zone:
                 # 距离越近，寻路权重越低。逼近 STOP_DIST 时权重归0，完全专注避障。
                 track_weight = max(0.0, (min_scan - STOP_DIST) / (p_safe_dist - STOP_DIST))
+                active_log_branches.append(f"C.1 注意力衰减(w={track_weight:.2f})")
             else:
                 track_weight = 1.0
 
@@ -265,6 +271,9 @@ def main(args=None):
                     else:
                         repel_omega = -p_corner_weight * 1.8 # 否则默认向右突围
                         corner_mode = 'right'
+                
+                active_log_branches.append(f"C.2 墙角突围({corner_mode})")
+
                 if corner_mode != corner_mode_prev:
                     if corner_mode == 'major':
                         node.get_logger().info(
@@ -293,6 +302,7 @@ def main(args=None):
                 act_fl = min_fl < p_safe_dist
                 if act_fl:
                     repel_omega -= (p_safe_dist - min_fl) * 6.0
+                    active_log_branches.append("C.3 左前斥力")
                     if not edge_prev['repel_fl']:
                         node.get_logger().info(
                             f"[势场分支] 进入 C.3 左前斥力: min_fl={min_fl:.3f} < p_safe_dist={p_safe_dist}"
@@ -304,6 +314,7 @@ def main(args=None):
                 act_fr = min_fr < p_safe_dist
                 if act_fr:
                     repel_omega += (p_safe_dist - min_fr) * 6.0
+                    active_log_branches.append("C.3 右前斥力")
                     if not edge_prev['repel_fr']:
                         node.get_logger().info(
                             f"[势场分支] 进入 C.3 右前斥力: min_fr={min_fr:.3f} < p_safe_dist={p_safe_dist}"
@@ -315,6 +326,7 @@ def main(args=None):
                 act_l = min_l < 0.28
                 if act_l:
                     repel_omega -= (0.28 - min_l) * 4.0
+                    active_log_branches.append("C.3 左侧斥力")
                     if not edge_prev['repel_l']:
                         node.get_logger().info(
                             f"[势场分支] 进入 C.3 左侧斥力: min_l={min_l:.3f} < 0.28"
@@ -326,6 +338,7 @@ def main(args=None):
                 act_r = min_r < 0.28
                 if act_r:
                     repel_omega += (0.28 - min_r) * 4.0
+                    active_log_branches.append("C.3 右侧斥力")
                     if not edge_prev['repel_r']:
                         node.get_logger().info(
                             f"[势场分支] 进入 C.3 右侧斥力: min_r={min_r:.3f} < 0.28"
@@ -340,6 +353,7 @@ def main(args=None):
             if in_cylinder_logic:
                 bias_dir = 1.5 if (min_fl + min_l) > (min_fr + min_r) + 0.15 else -1.5
                 repel_omega += bias_dir * (p_safe_dist - min_f)
+                active_log_branches.append(f"C.4 正前绕障(bias={bias_dir})")
                 if not edge_prev['cylinder']:
                     node.get_logger().info(
                         f"[势场分支] 进入 C.4 正前绕障: min_f={min_f:.3f} < p_safe_dist 且非墙角，"
@@ -350,6 +364,12 @@ def main(args=None):
                 if edge_prev['cylinder']:
                     node.get_logger().info("[势场分支] 离开 C.4 正前绕障逻辑")
                 edge_prev['cylinder'] = False
+
+            # 发布逻辑状态
+            if active_log_branches:
+                log_msg = String()
+                log_msg.data = " | ".join(active_log_branches)
+                log_pub.publish(log_msg)
 
             # -------------------------------------------------------------
             # --- D. 速度合成与物理约束 ---
