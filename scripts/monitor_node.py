@@ -6,7 +6,6 @@ import math
 import os
 from datetime import datetime
 
-import matplotlib.pyplot as plt
 import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -26,7 +25,7 @@ class RobotMonitor(Node):
 
         now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.csv_file = os.path.join(self.log_dir, f'odom_data_{now_str}.csv')
-        self.plot_file = os.path.join(self.log_dir, f'velocity_plot_{now_str}.png')
+        self.velocity_table_file = os.path.join(self.log_dir, f'velocity_table_{now_str}.csv')
         self.logic_log_file = os.path.join(self.log_dir, f'avoidance_logic_{now_str}.txt')
 
         # 数据缓存
@@ -98,30 +97,18 @@ class RobotMonitor(Node):
         self.get_logger().info(f'[避障逻辑] {msg.data}')
 
     def finalize(self):
-        self.get_logger().info('正在生成速度折线图...')
+        self.get_logger().info('正在生成速度表...')
         if not self.timestamps:
-            self.get_logger().warn('没有接收到足够的数据，无法生成图表。')
+            self.get_logger().warn('没有接收到足够的数据，无法生成速度表。')
             return
 
-        plt.figure(figsize=(12, 6))
-        plt.subplot(2, 1, 1)
-        plt.plot(self.timestamps, self.linear_v, 'b-', label='Linear Velocity (m/s)')
-        plt.ylabel('Linear V')
-        plt.legend()
-        plt.grid(True)
-        plt.title('Robot Velocity Monitor')
+        with open(self.velocity_table_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['index', 'time_s', 'linear_velocity_mps', 'angular_velocity_radps'])
+            for idx, (t, v_lin, v_ang) in enumerate(zip(self.timestamps, self.linear_v, self.angular_v), start=1):
+                writer.writerow([idx, f'{t:.3f}', f'{v_lin:.4f}', f'{v_ang:.4f}'])
 
-        plt.subplot(2, 1, 2)
-        plt.plot(self.timestamps, self.angular_v, 'r-', label='Angular Velocity (rad/s)')
-        plt.ylabel('Angular V')
-        plt.xlabel('Time (s)')
-        plt.legend()
-        plt.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(self.plot_file)
-        plt.close()
-        self.get_logger().info(f'折线图已保存至: {self.plot_file}')
+        self.get_logger().info(f'速度表已保存至: {self.velocity_table_file}')
         self.get_logger().info(f'Odom数据已保存至: {self.csv_file}')
         self.get_logger().info(f'避障日志已保存至: {self.logic_log_file}')
 
