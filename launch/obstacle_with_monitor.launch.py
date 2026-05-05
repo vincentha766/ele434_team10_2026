@@ -10,6 +10,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     use_monitor = LaunchConfiguration('use_monitor')
     log_dir_arg = LaunchConfiguration('log_dir')
+    default_log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'robot_logs'))
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -19,7 +20,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'log_dir',
-            default_value=os.path.join(os.getcwd(), 'robot_logs'),
+            default_value=default_log_dir,
             description='Directory to save robot logs',
         ),
         Node(

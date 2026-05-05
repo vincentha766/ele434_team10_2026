@@ -105,17 +105,56 @@ def main(args=None):
     node.create_subscription(Odometry, '/odom', odom_callback, 10)
     node.create_subscription(LaserScan, '/scan', scan_callback, 10)
 
-    # 3. 核心算法参数配置
-    p_max_v = 0.26           # 最高线速度 (m/s)
-    p_max_w = 1.82            # 最高角速度 (rad/s)
-    p_safe_dist = 0.35       # 避障预警距离: < 0.35m 时开始产生排斥力
-    p_corner_weight = 1.0    # 墙角逃逸权重: 越大，被卡在死角时甩尾越猛烈
-    enable_repeat = True     # 是否无限跑圈
-    
-    # 4. 物理防撞极限参数 (基于 Waffle 硬件尺寸)
-    STOP_DIST = 0.22         # 物理极限距离: Waffle 包络圆半径为 0.22m。突破此值将触发刹车。
-    BOX_LIMIT = 0.28         # 得分判定容差: 0.5m(区块半宽) - 0.22m(车身半径) = 0.28m。
-    MIN_FORWARD_SPEED = 0.06 # 最低前进速度: 强制走弧线避障，禁止底盘原地打转。
+    # 3. 关键参数安全初始化（支持外部参数覆盖 + 本地默认兜底 + 范围校验）
+    # 目的：防止误配置导致除零、超速、或“看起来像卡死”的异常行为。
+    node.declare_parameter('p_max_v', 0.26)
+    node.declare_parameter('p_max_w', 1.82)
+    node.declare_parameter('p_safe_dist', 0.35)
+    node.declare_parameter('p_corner_weight', 1.0)
+    node.declare_parameter('p_track_gain', 1.6)
+    node.declare_parameter('enable_repeat', True)
+    node.declare_parameter('stop_dist', 0.22)
+    node.declare_parameter('box_limit', 0.28)
+    node.declare_parameter('min_forward_speed', 0.06)
+
+    def clamp(value, lo, hi):
+        return max(lo, min(hi, value))
+
+    p_max_v = float(node.get_parameter('p_max_v').value)
+    p_max_w = float(node.get_parameter('p_max_w').value)
+    p_safe_dist = float(node.get_parameter('p_safe_dist').value)
+    p_corner_weight = float(node.get_parameter('p_corner_weight').value)
+    p_track_gain = float(node.get_parameter('p_track_gain').value)
+    enable_repeat = bool(node.get_parameter('enable_repeat').value)
+    STOP_DIST = float(node.get_parameter('stop_dist').value)
+    BOX_LIMIT = float(node.get_parameter('box_limit').value)
+    MIN_FORWARD_SPEED = float(node.get_parameter('min_forward_speed').value)
+
+    # 基础物理范围（面向 TurtleBot3 Waffle 的保守约束）
+    p_max_v = clamp(p_max_v, 0.05, 0.30)            # 最高线速度 (m/s)
+    p_max_w = clamp(p_max_w, 0.30, 2.84)            # 最高角速度 (rad/s)
+    p_safe_dist = clamp(p_safe_dist, 0.20, 1.00)    # 避障预警距离
+    p_corner_weight = clamp(p_corner_weight, 0.10, 3.00)
+    p_track_gain = clamp(p_track_gain, 0.50, 3.00)
+    STOP_DIST = clamp(STOP_DIST, 0.16, 0.45)        # 物理极限距离
+    BOX_LIMIT = clamp(BOX_LIMIT, 0.10, 0.45)        # 到达判定容差
+    MIN_FORWARD_SPEED = clamp(MIN_FORWARD_SPEED, 0.03, p_max_v)
+
+    # 强制保证 p_safe_dist > STOP_DIST，避免分母为0或负值
+    if p_safe_dist <= STOP_DIST + 0.02:
+        p_safe_dist = STOP_DIST + 0.02
+        node.get_logger().warn(
+            "参数保护触发: p_safe_dist 过小，已自动调整为 STOP_DIST + 0.02"
+        )
+
+    node.get_logger().info(
+        "参数初始化完成: "
+        f"p_max_v={p_max_v:.3f}, p_max_w={p_max_w:.3f}, "
+        f"p_safe_dist={p_safe_dist:.3f}, stop_dist={STOP_DIST:.3f}, "
+        f"min_forward_speed={MIN_FORWARD_SPEED:.3f}, p_track_gain={p_track_gain:.3f}, "
+        f"box_limit={BOX_LIMIT:.3f}, p_corner_weight={p_corner_weight:.3f}, "
+        f"enable_repeat={enable_repeat}"
+    )
 
     # 5. 场地拓扑与航点坐标 (顺时针，1号位于右上角)
     waypoints = [
@@ -225,7 +264,8 @@ def main(args=None):
             attention_zone = min_scan < p_safe_dist
             if attention_zone:
                 # 距离越近，寻路权重越低。逼近 STOP_DIST 时权重归0，完全专注避障。
-                track_weight = max(0.0, (min_scan - STOP_DIST) / (p_safe_dist - STOP_DIST))
+                safe_gap = max(p_safe_dist - STOP_DIST, 1e-6)
+                track_weight = max(0.0, (min_scan - STOP_DIST) / safe_gap)
                 active_log_branches.append(f"C.1 注意力衰减(w={track_weight:.2f})")
             else:
                 track_weight = 1.0
@@ -241,7 +281,7 @@ def main(args=None):
                 )
             edge_prev['attention'] = attention_zone
                 
-            omega_track = angle_error * 1.6 * track_weight
+            omega_track = angle_error * p_track_gain * track_weight
             repel_omega = 0.0
             
             # C.2 墙角检测与破局
@@ -381,7 +421,8 @@ def main(args=None):
             # 线速度动态削减: 弯越急、前方越危险，车速越慢
             speed_factor = 1.0 - (abs(angle_error) / math.pi)
             if min_f < p_safe_dist:
-                obs_limit = max(0.05, (min_f - STOP_DIST) / (p_safe_dist - STOP_DIST))
+                safe_gap = max(p_safe_dist - STOP_DIST, 1e-6)
+                obs_limit = max(0.05, (min_f - STOP_DIST) / safe_gap)
                 speed_factor = min(speed_factor, obs_limit)
             
             linear_vel = p_max_v * max(speed_factor, 0.2)

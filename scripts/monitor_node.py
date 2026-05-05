@@ -18,7 +18,8 @@ class RobotMonitor(Node):
         super().__init__('robot_monitor')
 
         # 参数设置
-        self.declare_parameter('log_dir', 'robot_logs')
+        default_log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'robot_logs'))
+        self.declare_parameter('log_dir', default_log_dir)
         self.log_dir = self.get_parameter('log_dir').get_parameter_value().string_value
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
