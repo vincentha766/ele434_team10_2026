@@ -116,6 +116,7 @@ def main(args=None):
     node.declare_parameter('stop_dist', 0.22)
     node.declare_parameter('box_limit', 0.28)
     node.declare_parameter('min_forward_speed', 0.06)
+    node.declare_parameter('reset_odom_on_start', True)
 
     def clamp(value, lo, hi):
         return max(lo, min(hi, value))
@@ -129,6 +130,7 @@ def main(args=None):
     STOP_DIST = float(node.get_parameter('stop_dist').value)
     BOX_LIMIT = float(node.get_parameter('box_limit').value)
     MIN_FORWARD_SPEED = float(node.get_parameter('min_forward_speed').value)
+    reset_odom_on_start = bool(node.get_parameter('reset_odom_on_start').value)
 
     # 基础物理范围（面向 TurtleBot3 Waffle 的保守约束）
     p_max_v = clamp(p_max_v, 0.05, 0.30)            # 最高线速度 (m/s)
@@ -153,7 +155,7 @@ def main(args=None):
         f"p_safe_dist={p_safe_dist:.3f}, stop_dist={STOP_DIST:.3f}, "
         f"min_forward_speed={MIN_FORWARD_SPEED:.3f}, p_track_gain={p_track_gain:.3f}, "
         f"box_limit={BOX_LIMIT:.3f}, p_corner_weight={p_corner_weight:.3f}, "
-        f"enable_repeat={enable_repeat}"
+        f"enable_repeat={enable_repeat}, reset_odom_on_start={reset_odom_on_start}"
     )
 
     # 5. 场地拓扑与航点坐标 (顺时针，1号位于右上角)
@@ -166,9 +168,14 @@ def main(args=None):
     current_idx = 0  # 当前目标航点索引 (初始化为第 1 个区域)
     
     initialized_start_point = False
+    origin_initialized = False
+    origin_x = 0.0
+    origin_y = 0.0
+    origin_yaw = 0.0
     # 避障 / 状态调试：按时间节流打印，避免 20Hz 刷屏
     debug_log_interval = 0.35  # 秒
     last_debug_log_mono = 0.0
+    param_echoed_once = False
     # [势场分支] 边沿检测：只在“刚进入/刚离开”某分支时打印，避免每周期重复
     edge_prev = {
         'attention': False,   # min_scan < p_safe_dist，引力衰减区
@@ -197,15 +204,46 @@ def main(args=None):
                 continue
                 
             if not initialized_start_point:
+                if reset_odom_on_start and not origin_initialized:
+                    origin_x = odom_x
+                    origin_y = odom_y
+                    origin_yaw = odom_yaw
+                    origin_initialized = True
+                    node.get_logger().info(
+                        f"已初始化局部坐标原点: origin=({origin_x:.3f},{origin_y:.3f}), "
+                        f"yaw0={math.degrees(origin_yaw):.1f}deg"
+                    )
+                elif not reset_odom_on_start:
+                    node.get_logger().info("未启用 reset_odom_on_start，使用全局 /odom 坐标")
                 node.get_logger().info(f"传感器就绪！前往 1 号区域: {waypoints[current_idx]}")
                 initialized_start_point = True
+            
+            # 仅在进入主循环后打印一次关键参数，便于日志复盘时定位运行配置
+            if not param_echoed_once:
+                node.get_logger().info(
+                    "[运行参数] "
+                    f"safe={p_safe_dist:.3f}, stop={STOP_DIST:.3f}, box={BOX_LIMIT:.3f}, "
+                    f"v_max={p_max_v:.3f}, w_max={p_max_w:.3f}, v_min={MIN_FORWARD_SPEED:.3f}, "
+                    f"track_gain={p_track_gain:.3f}, corner_weight={p_corner_weight:.3f}, "
+                    f"repeat={enable_repeat}, reset_odom={reset_odom_on_start}"
+                )
+                param_echoed_once = True
+
+            if reset_odom_on_start:
+                odom_x_nav = odom_x - origin_x
+                odom_y_nav = odom_y - origin_y
+                odom_yaw_nav = wrap_to_pi(odom_yaw - origin_yaw)
+            else:
+                odom_x_nav = odom_x
+                odom_y_nav = odom_y
+                odom_yaw_nav = odom_yaw
 
             # -------------------------------------------------------------
             # --- A. 状态机与到达判定 ---
             # -------------------------------------------------------------
             target_x, target_y = waypoints[current_idx]
-            dx = target_x - odom_x
-            dy = target_y - odom_y
+            dx = target_x - odom_x_nav
+            dy = target_y - odom_y_nav
             
             # 判定条件: X偏差和Y偏差同时小于 BOX_LIMIT 时，确认车体 100% 进入目标区域
             if abs(dx) < BOX_LIMIT and abs(dy) < BOX_LIMIT:
@@ -223,8 +261,8 @@ def main(args=None):
                 
                 # 更新为新目标点的坐标差
                 target_x, target_y = waypoints[current_idx]
-                dx = target_x - odom_x
-                dy = target_y - odom_y
+                dx = target_x - odom_x_nav
+                dy = target_y - odom_y_nav
 
             # -------------------------------------------------------------
             # --- B. 激光雷达 8 扇区高精度划分 ---
@@ -253,7 +291,7 @@ def main(args=None):
             # 详见文件头部「人工势场避障」说明；下列 C.1~C.4 对应不同“势能补丁”分支。
             # -------------------------------------------------------------
             target_angle = math.atan2(dy, dx)
-            angle_error = wrap_to_pi(target_angle - odom_yaw)
+            angle_error = wrap_to_pi(target_angle - odom_yaw_nav)
             
             # 用于记录当前周期的所有激活逻辑，输出到 log_pub
             active_log_branches = []
@@ -417,9 +455,12 @@ def main(args=None):
             # 最终角速度 = 寻路引力 + 避障斥力，并进行硬限幅
             final_w = omega_track + repel_omega
             angular_vel = max(min(final_w, p_max_w), -p_max_w)
+            angular_saturated = abs(final_w - angular_vel) > 1e-6
 
             # 线速度动态削减: 弯越急、前方越危险，车速越慢
-            speed_factor = 1.0 - (abs(angle_error) / math.pi)
+            heading_factor = 1.0 - (abs(angle_error) / math.pi)
+            speed_factor = heading_factor
+            obs_limit = 1.0
             if min_f < p_safe_dist:
                 safe_gap = max(p_safe_dist - STOP_DIST, 1e-6)
                 obs_limit = max(0.05, (min_f - STOP_DIST) / safe_gap)
@@ -443,6 +484,7 @@ def main(args=None):
                 linear_vel = MIN_FORWARD_SPEED
             else:
                 edge_prev['brake_front'] = False
+            linear_floor_applied = linear_vel <= MIN_FORWARD_SPEED + 1e-9
 
             # -------------------------------------------------------------
             # --- E. 组装并发布 TwistStamped 控制指令 ---
@@ -464,16 +506,22 @@ def main(args=None):
                 yaw_err_deg = math.degrees(angle_error)
                 attention = min_scan < p_safe_dist
                 brake_zone = min_f <= STOP_DIST
+                branch_text = " / ".join(active_log_branches) if active_log_branches else "None"
                 node.get_logger().info(
                     f"[避障调试] idx={current_idx} "
-                    f"pos=({odom_x:.3f},{odom_y:.3f}) yaw_deg={math.degrees(odom_yaw):.1f} | "
+                    f"origin=({origin_x:.2f},{origin_y:.2f},{math.degrees(origin_yaw):.1f}deg) "
+                    f"pos_raw=({odom_x:.3f},{odom_y:.3f}) yaw_raw_deg={math.degrees(odom_yaw):.1f} | "
+                    f"pos_nav=({odom_x_nav:.3f},{odom_y_nav:.3f}) yaw_nav_deg={math.degrees(odom_yaw_nav):.1f} | "
                     f"目标=({target_x:.2f},{target_y:.2f}) dist_wp={dist_wp:.3f} yaw_err={yaw_err_deg:.1f}° | "
                     f"扇区 F/FL/FR/L/R={min_f:.2f}/{min_fl:.2f}/{min_fr:.2f}/{min_l:.2f}/{min_r:.2f} "
                     f"min_scan={min_scan:.2f} | "
                     f"墙角={is_in_corner} 专注避障={attention} 刹车区={brake_zone} | "
                     f"track_w={track_weight:.2f} ω_跟踪={omega_track:.3f} ω_斥力={repel_omega:.3f} "
-                    f"ω_合成={final_w:.3f} | "
-                    f"cmd v={linear_vel:.3f} w={angular_vel:.3f}"
+                    f"ω_合成={final_w:.3f} sat_w={angular_saturated} | "
+                    f"head_factor={heading_factor:.2f} obs_limit={obs_limit:.2f} speed_factor={speed_factor:.2f} "
+                    f"v_floor={linear_floor_applied} | "
+                    f"cmd v={linear_vel:.3f} w={angular_vel:.3f} | "
+                    f"branches={branch_text}"
                 )
             
             cmd_pub.publish(cmd)

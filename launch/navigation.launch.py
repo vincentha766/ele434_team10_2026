@@ -3,7 +3,11 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'robot_logs'))
+    launch_dir = os.path.dirname(__file__)
+    workspace_root = os.path.abspath(os.path.join(launch_dir, '..', '..', '..', '..', '..'))
+    src_log_dir = os.path.join(workspace_root, 'src', 'ele434_team10_2026', 'robot_logs')
+    fallback_log_dir = os.path.abspath(os.path.join(launch_dir, '..', 'robot_logs'))
+    log_dir = src_log_dir if os.path.isdir(os.path.join(workspace_root, 'src', 'ele434_team10_2026')) else fallback_log_dir
 
     return LaunchDescription([
         # 1. 启动航点管理器

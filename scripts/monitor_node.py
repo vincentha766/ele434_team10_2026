@@ -18,7 +18,11 @@ class RobotMonitor(Node):
         super().__init__('robot_monitor')
 
         # 参数设置
-        default_log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'robot_logs'))
+        script_dir = os.path.dirname(__file__)
+        workspace_root = os.path.abspath(os.path.join(script_dir, '..', '..', '..', '..'))
+        src_log_dir = os.path.join(workspace_root, 'src', 'ele434_team10_2026', 'robot_logs')
+        fallback_log_dir = os.path.abspath(os.path.join(script_dir, '..', 'robot_logs'))
+        default_log_dir = src_log_dir if os.path.isdir(os.path.join(workspace_root, 'src', 'ele434_team10_2026')) else fallback_log_dir
         self.declare_parameter('log_dir', default_log_dir)
         self.log_dir = self.get_parameter('log_dir').get_parameter_value().string_value
         if not os.path.exists(self.log_dir):
