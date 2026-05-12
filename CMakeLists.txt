@@ -25,7 +25,18 @@ install(PROGRAMS
   scripts/stop_me.py
   scripts/obstacle.py
   scripts/work.py
+  scripts/test_nav_math.py
+  scripts/test_cost_field.py
+  scripts/test_planner.py
+  scripts/test_reactive_safety.py
+  scripts/test_motion.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install launch files
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_package()

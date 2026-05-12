@@ -1,1 +1,2 @@
 *.slxc
+__pycache__/

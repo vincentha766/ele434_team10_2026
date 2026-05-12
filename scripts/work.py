@@ -59,7 +59,6 @@
 
 import rclpy
 import tf2_ros
-import heapq
 import numpy as np
 from rclpy.duration import Duration
 from geometry_msgs.msg import TwistStamped
@@ -68,201 +67,17 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 import math
 import time
 
-odom_ready = False
-lidar_ready = False
-map_ready   = False
-odom_x = 0.0
-odom_y = 0.0
-odom_yaw = 0.0
-lidar_ranges = []
-map_grid = None
-map_res = 0.05
-map_origin_x = 0.0
-map_origin_y = 0.0
-map_w = 0
-map_h = 0
-
-
-def odom_callback(msg):
-    global odom_ready, odom_x, odom_y, odom_yaw
-    odom_x = msg.pose.pose.position.x
-    odom_y = msg.pose.pose.position.y
-    q = msg.pose.pose.orientation
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    odom_yaw = math.atan2(siny, cosy)
-    odom_ready = True
-
-
-def scan_callback(msg):
-    global lidar_ready, lidar_ranges
-    cleaned = []
-    for r in msg.ranges:
-        if math.isnan(r) or math.isinf(r) or r < 0.05:
-            cleaned.append(3.5)
-        else:
-            cleaned.append(r)
-    lidar_ranges = cleaned
-    lidar_ready = True
-
-
-def map_callback(msg):
-    global map_ready, map_grid, map_res, map_origin_x, map_origin_y, map_w, map_h
-    map_w = msg.info.width
-    map_h = msg.info.height
-    map_grid = np.array(msg.data, dtype=np.int8).reshape(map_h, map_w)
-    map_res = msg.info.resolution
-    map_origin_x = msg.info.origin.position.x
-    map_origin_y = msg.info.origin.position.y
-    map_ready = True
-
-
-def wrap_to_pi(a):
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def world_to_grid(x, y):
-    c = int((x - map_origin_x) / map_res)
-    r = int((y - map_origin_y) / map_res)
-    return c, r
-
-
-def grid_to_world(c, r):
-    return (map_origin_x + (c + 0.5) * map_res,
-            map_origin_y + (r + 0.5) * map_res)
-
-
-def inflate(grid, radius):
-    """Chebyshev 膨胀, 障碍 (>=50) 周围 radius 格全标 True (二元)"""
-    occ = (grid >= 50)
-    out = occ.copy()
-    for _ in range(radius):
-        new = out.copy()
-        new[:-1] |= out[1:]
-        new[1:]  |= out[:-1]
-        new[:, :-1] |= out[:, 1:]
-        new[:, 1:]  |= out[:, :-1]
-        out = new
-    return out
-
-
-def cost_field(grid, hard_r, soft_r):
-    """
-    返回 (blocked, cost):
-      blocked: hard_r 格内的视为不可走 (二元)
-      cost:    超出 hard_r 但在 soft_r 内, 按到障碍距离给附加代价
-               距离越近代价越高, A* 会本能远离障碍但允许靠近
-    """
-    h, w = grid.shape
-    occ = (grid >= 50)
-    # 用 BFS / 多次膨胀算最近障碍距离 (Chebyshev)
-    dist = np.full((h, w), 99, dtype=np.int8)
-    dist[occ] = 0
-    cur = occ.copy()
-    for d in range(1, soft_r + 1):
-        new = cur.copy()
-        new[:-1] |= cur[1:]
-        new[1:]  |= cur[:-1]
-        new[:, :-1] |= cur[:, 1:]
-        new[:, 1:]  |= cur[:, :-1]
-        newly = new & ~cur
-        dist[newly] = d
-        cur = new
-    blocked = dist <= hard_r
-    # cost: dist == hard_r+1 给最高额外代价, 离得远递减
-    extra = np.zeros((h, w), dtype=np.float32)
-    for d in range(hard_r + 1, soft_r + 1):
-        extra[dist == d] = (soft_r - d + 1) * 0.6   # 离障碍越近 cost 越高
-    return blocked, extra
-
-
-def unblock(blocked, c, r, radius):
-    h, w = blocked.shape
-    for dr in range(-radius, radius + 1):
-        for dc in range(-radius, radius + 1):
-            nc, nr = c + dc, r + dr
-            if 0 <= nc < w and 0 <= nr < h:
-                blocked[nr, nc] = False
-
-
-def astar(blocked, start, goal, extra_cost=None):
-    """8-连通 A*, blocked 是 bool 2D, extra_cost 是 [h,w] float (可选, 软膨胀代价)"""
-    h, w = blocked.shape
-    if not (0 <= start[0] < w and 0 <= start[1] < h): return None
-    if not (0 <= goal[0] < w and 0 <= goal[1] < h):   return None
-    if blocked[goal[1], goal[0]]: return None
-    if start == goal: return [start]
-    DIRS = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-    def hd(a, b): return math.hypot(a[0]-b[0], a[1]-b[1])
-    open_h = [(hd(start, goal), 0.0, start)]
-    came = {start: None}
-    g = {start: 0.0}
-    while open_h:
-        _, gc, cur = heapq.heappop(open_h)
-        if gc > g.get(cur, float('inf')): continue
-        if cur == goal:
-            path = []
-            while cur is not None:
-                path.append(cur)
-                cur = came[cur]
-            return list(reversed(path))
-        for dc, dr in DIRS:
-            nc, nr = cur[0] + dc, cur[1] + dr
-            if nc < 0 or nc >= w or nr < 0 or nr >= h: continue
-            if blocked[nr, nc]: continue
-            step = 1.41421 if (dc and dr) else 1.0
-            if extra_cost is not None:
-                step += float(extra_cost[nr, nc])
-            ng = gc + step
-            n = (nc, nr)
-            if ng < g.get(n, float('inf')):
-                g[n] = ng
-                came[n] = cur
-                heapq.heappush(open_h,
-                               (ng + hd(n, goal), ng, n))
-    return None
-
-
-def plan_path(start_xy, goal_xy, hard_r=4, soft_r=8):
-    """
-    A* 软膨胀:
-      hard_r 格内 = 不可走 (~20cm 物理半径)
-      hard_r..soft_r 格 = 可走但代价增加 (倾向远离障碍但允许靠近)
-    若 hard 起点/终点恰好被堵, 解锁 2 格.
-    """
-    if not map_ready or map_grid is None:
-        return None, None
-    s = world_to_grid(*start_xy)
-    g = world_to_grid(*goal_xy)
-    blocked, extra = cost_field(map_grid, hard_r, soft_r)
-    unblock(blocked, s[0], s[1], 2)
-    unblock(blocked, g[0], g[1], 2)
-    cells = astar(blocked, s, g, extra_cost=extra)
-    if cells is None:
-        # fallback: 更小的 hard radius
-        blocked2, _ = cost_field(map_grid, max(1, hard_r // 2), soft_r)
-        unblock(blocked2, s[0], s[1], 2)
-        unblock(blocked2, g[0], g[1], 2)
-        cells = astar(blocked2, s, g, extra_cost=extra)
-        if cells is None:
-            return None, None
-    pts = [grid_to_world(c, r) for c, r in cells]
-    if len(pts) > 6:
-        step = max(1, len(pts) // 5)
-        ds = pts[::step]
-        if ds[-1] != pts[-1]:
-            ds.append(pts[-1])
-        pts = ds
-    return pts, hard_r
-
-
-def sector_min(ranges, a_deg, b_deg):
-    n = len(ranges)
-    a = int(round(a_deg * n / 360.0)) % n
-    b = int(round(b_deg * n / 360.0)) % n
-    if a <= b:
-        return min(ranges[a:b + 1])
-    return min(ranges[a:] + ranges[:b + 1])
+from ele434_team10_2026_modules.nav_math import (
+    wrap_to_pi, yaw_from_quaternion,
+)
+from ele434_team10_2026_modules.path_planner import plan_path
+from ele434_team10_2026_modules.motion_control import (
+    find_lookahead_point, pure_pursuit,
+)
+from ele434_team10_2026_modules.reactive_safety import (
+    sector_min, apply_safety,
+)
+from ele434_team10_2026_modules.debug_logger import RunLogger
 
 
 def publish_cmd(pub, node, v, w):
@@ -275,17 +90,60 @@ def publish_cmd(pub, node, v, w):
 
 
 def main(args=None):
-    global odom_x, odom_y, odom_yaw
-
     rclpy.init(args=args)
     node = rclpy.create_node('astar_navigator')
     cmd_pub = node.create_publisher(TwistStamped, '/cmd_vel', 10)
-    node.create_subscription(Odometry, '/odom', odom_callback, 10)
-    node.create_subscription(LaserScan, '/scan', scan_callback, 10)
-    node.create_subscription(OccupancyGrid, '/map', map_callback, 10)
 
     tf_buffer = tf2_ros.Buffer()
     tf2_ros.TransformListener(tf_buffer, node)
+
+    # ---- sensor state (replaces globals) ----
+    state = {
+        'odom_ready': False,
+        'lidar_ready': False,
+        'map_ready': False,
+        'odom_x': 0.0,
+        'odom_y': 0.0,
+        'odom_yaw': 0.0,
+        'lidar_ranges': [],
+        'map_grid': None,
+        'map_res': 0.05,
+        'map_origin_x': 0.0,
+        'map_origin_y': 0.0,
+        'map_w': 0,
+        'map_h': 0,
+    }
+
+    def odom_callback(msg):
+        state['odom_x'] = msg.pose.pose.position.x
+        state['odom_y'] = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        state['odom_yaw'] = yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        state['odom_ready'] = True
+
+    def scan_callback(msg):
+        cleaned = []
+        for r in msg.ranges:
+            if math.isnan(r) or math.isinf(r) or r < 0.05:
+                cleaned.append(3.5)
+            else:
+                cleaned.append(r)
+        state['lidar_ranges'] = cleaned
+        state['lidar_ready'] = True
+
+    def map_callback(msg):
+        state['map_w'] = msg.info.width
+        state['map_h'] = msg.info.height
+        state['map_grid'] = np.array(msg.data, dtype=np.int8).reshape(
+            msg.info.height, msg.info.width)
+        state['map_res'] = msg.info.resolution
+        state['map_origin_x'] = msg.info.origin.position.x
+        state['map_origin_y'] = msg.info.origin.position.y
+        state['map_ready'] = True
+
+    node.create_subscription(Odometry, '/odom', odom_callback, 10)
+    node.create_subscription(LaserScan, '/scan', scan_callback, 10)
+    node.create_subscription(OccupancyGrid, '/map', map_callback, 10)
 
     # ----- 调参 -----
     V_MAX        = 0.26       # hw 标称速度
@@ -303,14 +161,14 @@ def main(args=None):
     # (C) 侧前方也保护; SAFE 触发刹停, SLOW 触发减速
     SAFE_FRONT   = 0.28
     SLOW_FRONT   = 0.50
-    SAFE_SIDE    = 0.22       # 侧前 ±20-60° 比这近就强减速
+    SAFE_SIDE    = 0.23       # 侧前 ±20-60° 比这近就强减速
 
     STUCK_WINDOW = 3.0        # 放宽 stuck 检测 (慢走时 5cm/3s 不算 stuck)
     STUCK_DIST   = 0.08
     ESCAPE_DUR   = 1.0
     DEFER_STUCK  = 3          # 给更多机会
 
-    LOOKAHEAD    = 0.20
+    LOOKAHEAD    = 0.29
 
     WARMUP_T     = 4.0        # 启动原地自旋 N 秒让 SLAM 建图
 
@@ -337,33 +195,67 @@ def main(args=None):
     last_defer_t = {}     # cell_idx -> time
     DEFER_COOLDOWN = 10.0
 
+    # ---- 数据采集 / 调试日志 ----
+    dbg = RunLogger(
+        run_name='work',
+        trace_fields=[
+            'x', 'y', 'yaw_deg',
+            'cell', 'tgt_x', 'tgt_y',
+            'lh_x', 'lh_y', 'yaw_err_deg', 'd_goal',
+            'v_cmd', 'w_cmd',
+            'd_front', 'd_fl', 'd_fr',
+            'path_len', 'braked', 'in_escape',
+            'scored', 'cur_stuck', 'deferred_n',
+            'phase',
+        ],
+        params={
+            'V_MAX': V_MAX, 'W_MAX': W_MAX, 'K_YAW': K_YAW,
+            'YAW_HARD': YAW_HARD, 'SCORE_TOL': SCORE_TOL,
+            'REACH_TOL': REACH_TOL, 'MAX_RUN_T': MAX_RUN_T,
+            'HARD_R': HARD_R, 'SOFT_R': SOFT_R,
+            'REPLAN_PERIOD': REPLAN_PERIOD,
+            'SAFE_FRONT': SAFE_FRONT, 'SLOW_FRONT': SLOW_FRONT,
+            'SAFE_SIDE': SAFE_SIDE,
+            'STUCK_WINDOW': STUCK_WINDOW, 'STUCK_DIST': STUCK_DIST,
+            'ESCAPE_DUR': ESCAPE_DUR, 'DEFER_STUCK': DEFER_STUCK,
+            'LOOKAHEAD': LOOKAHEAD, 'WARMUP_T': WARMUP_T,
+        },
+    )
+    node.get_logger().info(f"调试日志目录: {dbg.dir}")
+    dbg.event('INIT', f'log_dir={dbg.dir}')
+
     node.get_logger().info("A* 节点已启动, 等待传感器 + map + SLAM ...")
 
     # 等 SLAM TF 报告靠近 (0,0)
     wait_t0 = time.time()
     while rclpy.ok() and time.time() - wait_t0 < 12.0:
         rclpy.spin_once(node, timeout_sec=0.05)
-        if not (odom_ready and lidar_ready):
+        if not (state['odom_ready'] and state['lidar_ready']):
             continue
         try:
             t = tf_buffer.lookup_transform(
                 'map', 'base_footprint', rclpy.time.Time(),
                 timeout=Duration(seconds=0.0))
             tx, ty = t.transform.translation.x, t.transform.translation.y
-            if math.hypot(tx, ty) < 0.4 and map_ready:
+            if math.hypot(tx, ty) < 0.4 and state['map_ready']:
                 node.get_logger().info(
-                    f"启动确认: pose=({tx:+.2f},{ty:+.2f}), map={map_w}x{map_h}")
+                    f"启动确认: pose=({tx:+.2f},{ty:+.2f}), "
+                    f"map={state['map_w']}x{state['map_h']}")
                 break
         except Exception:
             pass
 
     # (D) WARMUP: 原地慢转 WARMUP_T 秒, 让 SLAM 把周围 4 个 L + 4 beacon 都扫到
     node.get_logger().info(f"WARMUP: 原地转 {WARMUP_T}s 让 SLAM 建图...")
+    dbg.event('WARMUP_START', f'duration={WARMUP_T}s')
     warmup_t0 = time.time()
     while rclpy.ok() and time.time() - warmup_t0 < WARMUP_T:
         rclpy.spin_once(node, timeout_sec=0.05)
         publish_cmd(cmd_pub, node, 0.0, 1.6)   # 中等角速度自旋一圈半
     publish_cmd(cmd_pub, node, 0.0, 0.0)
+    dbg.event('WARMUP_DONE',
+              f'pose=({state["odom_x"]:+.2f},{state["odom_y"]:+.2f}) '
+              f'map_ready={state["map_ready"]}')
     node.get_logger().info("WARMUP 完成, 开始任务.")
 
     start_time = time.time()
@@ -371,23 +263,25 @@ def main(args=None):
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.05)
-            if not (odom_ready and lidar_ready):
+            if not (state['odom_ready'] and state['lidar_ready']):
                 continue
             try:
                 t = tf_buffer.lookup_transform(
                     'map', 'base_footprint', rclpy.time.Time(),
                     timeout=Duration(seconds=0.0))
-                odom_x = t.transform.translation.x
-                odom_y = t.transform.translation.y
+                state['odom_x'] = t.transform.translation.x
+                state['odom_y'] = t.transform.translation.y
                 q = t.transform.rotation
-                odom_yaw = math.atan2(
-                    2.0 * (q.w * q.z + q.x * q.y),
-                    1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                state['odom_yaw'] = yaw_from_quaternion(q.x, q.y, q.z, q.w)
             except (tf2_ros.LookupException,
                     tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException):
                 pass
 
+            odom_x = state['odom_x']
+            odom_y = state['odom_y']
+            odom_yaw = state['odom_yaw']
+            lidar_ranges = state['lidar_ranges']
             now_t = time.time()
 
             # 机会式打卡
@@ -400,16 +294,24 @@ def main(args=None):
                     node.get_logger().info(
                         f"[打卡 t={elapsed:5.1f}s] 格 {i + 1} "
                         f"({cx:+.1f},{cy:+.1f})  {sum(scored)}/12")
+                    dbg.event(
+                        'SCORED',
+                        f'cell={i + 1} at=({cx:+.1f},{cy:+.1f}) '
+                        f'elapsed={elapsed:.1f}s total={sum(scored)}/12')
                     if i == cur_idx:
                         cur_path = None  # 强制重规划下一个
 
             if all(scored):
                 node.get_logger().info(
                     f"12 格全覆盖 t={now_t-start_time:.1f}s, 停车.")
+                dbg.event('ALL_DONE', f'elapsed={now_t-start_time:.1f}s')
                 break
             if now_t - start_time > MAX_RUN_T:
                 node.get_logger().warn(
                     f"超时 90s, 已打卡 {sum(scored)}/12, 停车.")
+                dbg.event('TIMEOUT',
+                          f'elapsed={now_t-start_time:.1f}s '
+                          f'scored={sum(scored)}/12')
                 break
 
             # 贪心最近: 选最近的未打卡且未 deferred 的格
@@ -447,28 +349,33 @@ def main(args=None):
             # ---- 重规划 ----
             need_replan = (cur_path is None
                            or now_t - last_replan_t > REPLAN_PERIOD)
-            if need_replan and map_ready:
-                pp, rr_used = plan_path((odom_x, odom_y),
-                                         (target_x, target_y),
-                                         hard_r=HARD_R, soft_r=SOFT_R)
+            if need_replan and state['map_ready']:
+                pp, rr_used = plan_path(
+                    (odom_x, odom_y), (target_x, target_y),
+                    state['map_grid'], state['map_res'],
+                    state['map_origin_x'], state['map_origin_y'],
+                    hard_r=HARD_R, soft_r=SOFT_R)
                 if pp is None:
                     node.get_logger().warn(
                         f"A* 失败 cell{cur_idx+1}, 直线兜底")
+                    dbg.event(
+                        'REPLAN_FAIL',
+                        f'cell={cur_idx+1} from=({odom_x:+.2f},{odom_y:+.2f}) '
+                        f'to=({target_x:+.1f},{target_y:+.1f})')
                     cur_path = [(target_x, target_y)]
                 else:
                     cur_path = pp
+                    dbg.event(
+                        'REPLAN',
+                        f'cell={cur_idx+1} waypoints={len(pp)} rr={rr_used}')
                 last_replan_t = now_t
 
-            # 前瞻点
+            # 前瞻点 + yaw_err (stuck 检测需要 yaw_err)
             if cur_path is None or len(cur_path) == 0:
                 lh_x, lh_y = target_x, target_y
             else:
-                # 沿 cur_path 找第一个距离 robot > LOOKAHEAD 的点
-                lh_x, lh_y = cur_path[-1]
-                for px, py in cur_path:
-                    if math.hypot(px - odom_x, py - odom_y) > LOOKAHEAD:
-                        lh_x, lh_y = px, py
-                        break
+                lh_x, lh_y = find_lookahead_point(
+                    cur_path, odom_x, odom_y, LOOKAHEAD)
 
             target_yaw = math.atan2(lh_y - odom_y, lh_x - odom_x)
             yaw_err = wrap_to_pi(target_yaw - odom_yaw)
@@ -497,59 +404,99 @@ def main(args=None):
                     node.get_logger().warn(
                         f"[STUCK #{cur_stuck}] 后退{ESCAPE_DUR}s "
                         f"@({odom_x:+.2f},{odom_y:+.2f})")
+                    dbg.event(
+                        'STUCK',
+                        f'cell={cur_idx+1} n={cur_stuck} '
+                        f'pose=({odom_x:+.2f},{odom_y:+.2f}) '
+                        f'yaw={math.degrees(odom_yaw):+.1f} d_t={d_t:.3f}')
+                    # 把 lidar + 最近路径快照下来 — 没现场的话这是事后唯一线索
+                    if lidar_ranges:
+                        dbg.snapshot(
+                            f'stuck_cell{cur_idx+1}_n{cur_stuck}_lidar',
+                            [f'# pose=({odom_x:+.3f},{odom_y:+.3f}) '
+                             f'yaw_deg={math.degrees(odom_yaw):+.2f}']
+                            + [f'{i} {r:.3f}' for i, r in enumerate(lidar_ranges)])
+                    if cur_path:
+                        dbg.snapshot(
+                            f'stuck_cell{cur_idx+1}_n{cur_stuck}_path',
+                            [f'{px:.3f} {py:.3f}' for px, py in cur_path])
                     if cur_stuck >= DEFER_STUCK:
                         node.get_logger().warn(
                             f"[DEFER] 格 {cur_idx+1} STUCK {cur_stuck}x, 跳过.")
+                        dbg.event('DEFER', f'cell={cur_idx+1} after_stuck={cur_stuck}')
                         deferred.add(cur_idx)
                         last_defer_t[cur_idx] = now_t
-                        # 下一帧贪心选下一最近 cell, 不需要在这里强切
                         cur_stuck = 0
                     continue
 
             # ---- 速度 ----
-            if abs(yaw_err) > YAW_HARD:
-                v = 0.0
-                w = max(-W_MAX, min(W_MAX, K_YAW * yaw_err))
-            else:
-                v = V_MAX * math.cos(yaw_err)
-                w = max(-W_MAX, min(W_MAX, K_YAW * yaw_err))
+            v, w = pure_pursuit(
+                odom_x, odom_y, odom_yaw, cur_path, target_x, target_y,
+                LOOKAHEAD, V_MAX, W_MAX, K_YAW, YAW_HARD)
 
             # 反应式刹车 + 减速
-            if len(lidar_ranges) >= 36:
-                d_front = sector_min(lidar_ranges, -20, 20)
-                d_fl    = sector_min(lidar_ranges,  20, 60)
-                d_fr    = sector_min(lidar_ranges, -60, -20)
-                if d_front < SAFE_FRONT:
-                    v = 0.0
-                    cur_path = None
-                elif d_front < SLOW_FRONT:
-                    factor = (d_front - SAFE_FRONT) / (SLOW_FRONT - SAFE_FRONT)
-                    v *= max(0.3, factor)
-                # 侧前方近 -> 强制减速 (但不刹停, 否则过 L 时卡死)
-                d_side = min(d_fl, d_fr)
-                if d_side < SAFE_SIDE:
-                    v *= 0.4
+            v_pp, w_pp = v, w
+            v, w, braked = apply_safety(
+                lidar_ranges, v, w,
+                safe_front=SAFE_FRONT, slow_front=SLOW_FRONT,
+                safe_side=SAFE_SIDE)
+            if braked:
+                cur_path = None
+                dbg.event(
+                    'BRAKE',
+                    f'cell={cur_idx+1} pose=({odom_x:+.2f},{odom_y:+.2f}) '
+                    f'v={v_pp:.2f}->{v:.2f} w={w_pp:.2f}->{w:.2f}')
 
             publish_cmd(cmd_pub, node, v, w)
+
+            # 全量 lidar 三向汇总 + 状态写入 CSV
+            has_scan = len(lidar_ranges) >= 36
+            d_front = sector_min(lidar_ranges, -20, 20) if has_scan else -1.0
+            d_fl = sector_min(lidar_ranges, 20, 60) if has_scan else -1.0
+            d_fr = sector_min(lidar_ranges, -60, -20) if has_scan else -1.0
+            dbg.trace(
+                x=odom_x, y=odom_y, yaw_deg=math.degrees(odom_yaw),
+                cell=cur_idx + 1, tgt_x=target_x, tgt_y=target_y,
+                lh_x=lh_x, lh_y=lh_y,
+                yaw_err_deg=math.degrees(yaw_err), d_goal=d_goal,
+                v_cmd=v, w_cmd=w,
+                d_front=d_front, d_fl=d_fl, d_fr=d_fr,
+                path_len=(len(cur_path) if cur_path else 0),
+                braked=braked,
+                in_escape=(now_t < escape_until),
+                scored=sum(scored),
+                cur_stuck=cur_stuck,
+                deferred_n=len(deferred),
+                phase='run',
+            )
 
             # 状态日志
             if now_t - last_status_t >= 1.0:
                 last_status_t = now_t
                 path_len = len(cur_path) if cur_path else 0
-                df = (sector_min(lidar_ranges, -20, 20)
-                      if len(lidar_ranges) >= 36 else 0)
                 node.get_logger().info(
                     f"t={now_t-start_time:5.1f} "
                     f"pos=({odom_x:+.2f},{odom_y:+.2f}) yaw={math.degrees(odom_yaw):+6.1f} "
                     f"-> cell{cur_idx+1}({target_x:+.1f},{target_y:+.1f}) "
                     f"path={path_len} lh=({lh_x:+.1f},{lh_y:+.1f}) "
-                    f"v={v:+.2f} w={w:+.2f} d_f={df:.2f}")
+                    f"v={v:+.2f} w={w:+.2f} d_f={d_front:.2f}")
 
     except KeyboardInterrupt:
         node.get_logger().info("中断, 停车.")
+        dbg.event('INTERRUPT')
     finally:
         publish_cmd(cmd_pub, node, 0.0, 0.0)
         time.sleep(0.1)
+        try:
+            dbg.close(summary={
+                'scored_total': sum(scored),
+                'scored_cells': ','.join(str(i + 1) for i, s in enumerate(scored) if s),
+                'deferred_cells': ','.join(str(i + 1) for i in sorted(deferred)),
+                'elapsed_s': f'{time.time() - start_time:.2f}',
+            })
+            node.get_logger().info(f"调试日志写入: {dbg.dir}")
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
 
