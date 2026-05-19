@@ -21,27 +21,26 @@
 #   - STUCK 3 次的 cell 进 deferred 集合, 一圈后再解封
 #
 # 全局规划: A* + 软膨胀代价场 (cost_field)
-#   - HARD_R 内 (25cm): 不可走 (硬禁区)
-#   - HARD_R..SOFT_R (25-45cm): 可走但 cost 渐增, 倾向远离障碍但不绕远
-#   - 渐进 fallback: 起点/终点恰好在硬禁区 -> 局部解封 2 格
+#   - HARD_R 内 (35cm): 不可走 (硬禁区, robot 21cm + 障碍 10cm + 4cm 跟踪余量)
+#   - HARD_R..SOFT_R (35-55cm): 可走但 cost 渐增, 倾向远离障碍但不绕远
+#   - 终点贴障碍时不解封, 改 snap 到最近合法 cell (find_nearest_free)
+#   - 渐进 fallback HARD_R 7→6→5, 保留安全底线
 #   - REPLAN_PERIOD=1.0s 周期重规划, 适应实时建图
 #
-# 路径跟随: 纯追踪
-#   - LOOKAHEAD 0.20m 取路径上最近的前瞻点
-#   - cos(yaw_err) 调速度, K_YAW * yaw_err 调角速度
-#   - 偏差 > YAW_HARD 1.2rad 时只转不走
-#
-# 反应式安全层 (覆盖纯追踪输出):
-#   - SAFE_FRONT < 0.28m: 立即刹停 + 重规划 (撞前救援)
-#   - SLOW_FRONT < 0.50m: 按距离比例减速到 0.3*v
-#   - SAFE_SIDE < 0.22m (侧前 ±20-60°): v ×= 0.4 (L 挡板斜面常侧蹭)
+# 路径跟随: 纯追踪 + 跟踪稳定性
+#   - LOOKAHEAD 0.29m 取路径上最近的前瞻点
+#   - v = V_MAX * cos(yaw_err), 大偏差 (>YAW_HARD) 时只转不走
+#   - w = K_YAW * yaw_err 限幅在 ±W_MAX
 #
 # 兜底机制:
 #   - WARMUP 4s 启动自旋: 让 SLAM 在出发前看清 4 个 L + 4 beacon
-#                         (省 17s — 否则第一次过 L 时 A* 无图凭空规划)
 #   - STUCK 检测: 3s 内位移 < 8cm -> 后退 + 反向转 1s
 #   - DEFER: 同格 STUCK 3 次 -> 跳到下个最近, 一圈后回头
-#   - opportunistic 打卡: 进入任何 cell 0.29m 圈就记分, 路过即可
+#   - opportunistic 打卡: 进入任何 cell SCORE_TOL=0.45m 方圆就记分
+#     (大到能让障碍中心 cell 也从 cell 边缘合法打卡, 又不会跨 cell)
+#   - 分段紧急刹停 (lidar):
+#     ±15° 前向 < 0.22m: 即将正撞
+#     ±15-45° 侧前 < 0.16m: 侧前贴擦 (50cm 走廊不误触)
 #
 # ─────────────────────── 历史踩坑 ───────────────────────
 #
@@ -65,6 +64,7 @@ from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid
 import math
+import os
 import time
 
 from ele434_team10_2026_modules.nav_math import (
@@ -72,10 +72,10 @@ from ele434_team10_2026_modules.nav_math import (
 )
 from ele434_team10_2026_modules.path_planner import plan_path
 from ele434_team10_2026_modules.motion_control import (
-    find_lookahead_point, pure_pursuit,
+    find_lookahead_point,
 )
 from ele434_team10_2026_modules.reactive_safety import (
-    sector_min, apply_safety,
+    sector_min,
 )
 from ele434_team10_2026_modules.debug_logger import RunLogger
 
@@ -149,19 +149,17 @@ def main(args=None):
     V_MAX        = 0.26       # hw 标称速度
     W_MAX        = 1.82
     K_YAW        = 2.4
-    YAW_HARD     = 1.2
-    SCORE_TOL    = 0.29
+    SCORE_TOL    = 0.45      # 拉宽到 cell 半宽附近, 容许障碍在中心时从 cell 边缘打卡
     REACH_TOL    = 0.22
     MAX_RUN_T    = 240.0      # 放松时限, 优先零碰撞
 
-    HARD_R       = 5          # 25cm 硬禁区 (robot 半径 21cm + 4cm)
-    SOFT_R       = 9          # 45cm 软膨胀 (这之内 cost 渐增, 但仍可走)
+    HARD_R       = 7          # 35cm 硬禁区
+    SOFT_R       = 11         # 55cm 软膨胀
     REPLAN_PERIOD = 1.0
 
-    # (C) 侧前方也保护; SAFE 触发刹停, SLOW 触发减速
-    SAFE_FRONT   = 0.28
-    SLOW_FRONT   = 0.50
-    SAFE_SIDE    = 0.23       # 侧前 ±20-60° 比这近就强减速
+    # 紧急刹停: 极近距离才触发, 比 robot 半径稍小, 不在窄角落误触发
+    EMERG_FRONT  = 0.22       # lidar(中心) 到障碍表面 < 22cm = 即将贴 (robot 半径 21cm)
+    YAW_HARD     = 1.2        # 大偏差只转不走 (路径跟踪稳定性, 不是减速)
 
     STUCK_WINDOW = 3.0        # 放宽 stuck 检测 (慢走时 5cm/3s 不算 stuck)
     STUCK_DIST   = 0.08
@@ -194,6 +192,9 @@ def main(args=None):
     # 防 opportunistic 死循环: 每个 cell 上次被 defer 的时间, 冷却期内不重试
     last_defer_t = {}     # cell_idx -> time
     DEFER_COOLDOWN = 10.0
+    # 周期 dump SLAM 占据栅格 (诊断: 圆筒是否被 SLAM 看到 / cost_field 是什么样)
+    MAP_DUMP_PERIOD = 10.0
+    last_map_dump_t = 0.0
 
     # ---- 数据采集 / 调试日志 ----
     dbg = RunLogger(
@@ -203,19 +204,18 @@ def main(args=None):
             'cell', 'tgt_x', 'tgt_y',
             'lh_x', 'lh_y', 'yaw_err_deg', 'd_goal',
             'v_cmd', 'w_cmd',
-            'd_front', 'd_fl', 'd_fr',
-            'path_len', 'braked', 'in_escape',
+            'd_front', 'd_fl', 'd_fr', 'd_min', 'd_min_deg',
+            'path_len', 'in_escape',
             'scored', 'cur_stuck', 'deferred_n',
             'phase',
         ],
         params={
             'V_MAX': V_MAX, 'W_MAX': W_MAX, 'K_YAW': K_YAW,
-            'YAW_HARD': YAW_HARD, 'SCORE_TOL': SCORE_TOL,
+            'SCORE_TOL': SCORE_TOL,
             'REACH_TOL': REACH_TOL, 'MAX_RUN_T': MAX_RUN_T,
             'HARD_R': HARD_R, 'SOFT_R': SOFT_R,
             'REPLAN_PERIOD': REPLAN_PERIOD,
-            'SAFE_FRONT': SAFE_FRONT, 'SLOW_FRONT': SLOW_FRONT,
-            'SAFE_SIDE': SAFE_SIDE,
+            'EMERG_FRONT': EMERG_FRONT, 'YAW_HARD': YAW_HARD,
             'STUCK_WINDOW': STUCK_WINDOW, 'STUCK_DIST': STUCK_DIST,
             'ESCAPE_DUR': ESCAPE_DUR, 'DEFER_STUCK': DEFER_STUCK,
             'LOOKAHEAD': LOOKAHEAD, 'WARMUP_T': WARMUP_T,
@@ -283,6 +283,26 @@ def main(args=None):
             odom_yaw = state['odom_yaw']
             lidar_ranges = state['lidar_ranges']
             now_t = time.time()
+
+            # 周期 dump map_grid (.npy) + 元信息. SCORED 后强制 dump 一份.
+            if (state['map_ready']
+                    and (now_t - last_map_dump_t >= MAP_DUMP_PERIOD
+                         or last_map_dump_t == 0.0)):
+                last_map_dump_t = now_t
+                elapsed_dump = now_t - start_time
+                try:
+                    np.save(
+                        os.path.join(dbg.dir, f'map_t{int(elapsed_dump):04d}.npy'),
+                        state['map_grid'])
+                    dbg.event(
+                        'MAP_DUMP',
+                        f'elapsed={elapsed_dump:.1f}s '
+                        f'shape={state["map_grid"].shape} '
+                        f'res={state["map_res"]:.3f} '
+                        f'origin=({state["map_origin_x"]:+.2f},{state["map_origin_y"]:+.2f}) '
+                        f'pose=({odom_x:+.2f},{odom_y:+.2f})')
+                except Exception as e:
+                    dbg.event('MAP_DUMP_FAIL', f'err={e!r}')
 
             # 机会式打卡
             for i, (cx, cy) in enumerate(score_cells):
@@ -380,8 +400,7 @@ def main(args=None):
             target_yaw = math.atan2(lh_y - odom_y, lh_x - odom_x)
             yaw_err = wrap_to_pi(target_yaw - odom_yaw)
 
-            # ---- stuck (旋转期不算; 只在我们实际命令前进时积累 pose_hist) ----
-            # 注: yaw_err > YAW_HARD 时 v 会被设成 0, 那不是真 stuck
+            # ---- stuck (旋转期不算; YAW_HARD 时 v=0, 不是真 stuck) ----
             if abs(yaw_err) <= YAW_HARD:
                 pose_hist.append((now_t, odom_x, odom_y))
                 pose_hist = [p for p in pose_hist
@@ -430,30 +449,44 @@ def main(args=None):
                     continue
 
             # ---- 速度 ----
-            v, w = pure_pursuit(
-                odom_x, odom_y, odom_yaw, cur_path, target_x, target_y,
-                LOOKAHEAD, V_MAX, W_MAX, K_YAW, YAW_HARD)
+            # 路径跟踪: 大偏差只转不走, 否则 cos(yaw_err) 稳定弧线
+            if abs(yaw_err) > YAW_HARD:
+                v = 0.0
+            else:
+                v = V_MAX * math.cos(yaw_err)
+            w = max(-W_MAX, min(W_MAX, K_YAW * yaw_err))
 
-            # 反应式刹车 + 减速
-            v_pp, w_pp = v, w
-            v, w, braked = apply_safety(
-                lidar_ranges, v, w,
-                safe_front=SAFE_FRONT, slow_front=SLOW_FRONT,
-                safe_side=SAFE_SIDE)
-            if braked:
-                cur_path = None
-                dbg.event(
-                    'BRAKE',
-                    f'cell={cur_idx+1} pose=({odom_x:+.2f},{odom_y:+.2f}) '
-                    f'v={v_pp:.2f}->{v:.2f} w={w_pp:.2f}->{w:.2f}')
+            # 紧急刹停: 分段防撞.
+            #   ±15° 前向 < 0.22m: 即将正撞 (机器人前向冲入障碍)
+            #   ±15-45° 侧前 < 0.16m: 侧前贴擦, 仅极近时触发 (50cm 走廊不误触)
+            has_scan = len(lidar_ranges) >= 36
+            if has_scan:
+                d_front_emerg = sector_min(lidar_ranges, -15, 15)
+                d_left = sector_min(lidar_ranges, 15, 45)
+                d_right = sector_min(lidar_ranges, -45, -15)
+                if d_front_emerg < EMERG_FRONT or min(d_left, d_right) < 0.16:
+                    v = 0.0
+                    cur_path = None  # 强制重规划
 
             publish_cmd(cmd_pub, node, v, w)
 
-            # 全量 lidar 三向汇总 + 状态写入 CSV
+            # 全量 lidar 三向汇总 + 360° 全周最小 + 状态写入 CSV
             has_scan = len(lidar_ranges) >= 36
             d_front = sector_min(lidar_ranges, -20, 20) if has_scan else -1.0
             d_fl = sector_min(lidar_ranges, 20, 60) if has_scan else -1.0
             d_fr = sector_min(lidar_ranges, -60, -20) if has_scan else -1.0
+            if has_scan:
+                d_min_idx = min(range(len(lidar_ranges)),
+                                key=lambda i: lidar_ranges[i])
+                d_min = lidar_ranges[d_min_idx]
+                # 等价于 sector_min 的角度约定: idx 0 = 0°, 顺序 0..n-1 = 0..360°,
+                # 折回 [-180,180]
+                d_min_deg = d_min_idx * 360.0 / len(lidar_ranges)
+                if d_min_deg > 180.0:
+                    d_min_deg -= 360.0
+            else:
+                d_min = -1.0
+                d_min_deg = 0.0
             dbg.trace(
                 x=odom_x, y=odom_y, yaw_deg=math.degrees(odom_yaw),
                 cell=cur_idx + 1, tgt_x=target_x, tgt_y=target_y,
@@ -461,8 +494,8 @@ def main(args=None):
                 yaw_err_deg=math.degrees(yaw_err), d_goal=d_goal,
                 v_cmd=v, w_cmd=w,
                 d_front=d_front, d_fl=d_fl, d_fr=d_fr,
+                d_min=d_min, d_min_deg=d_min_deg,
                 path_len=(len(cur_path) if cur_path else 0),
-                braked=braked,
                 in_escape=(now_t < escape_until),
                 scored=sum(scored),
                 cur_stuck=cur_stuck,

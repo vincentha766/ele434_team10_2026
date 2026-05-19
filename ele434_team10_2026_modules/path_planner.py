@@ -15,6 +15,33 @@ def unblock(blocked, c, r, radius):
                 blocked[nr, nc] = False
 
 
+def find_nearest_free(blocked, c, r, max_radius):
+    """Return the nearest non-blocked cell to (c, r) within Chebyshev max_radius.
+
+    Used when the planning goal lies inside an obstacle's inflation zone —
+    instead of carving a tunnel through, we snap the goal to the closest
+    legal cell. Returns None if no free cell exists within range."""
+    h, w = blocked.shape
+    if 0 <= c < w and 0 <= r < h and not blocked[r, c]:
+        return (c, r)
+    best = None
+    best_d2 = 10 ** 9
+    for radius in range(1, max_radius + 1):
+        if best is not None:
+            break
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if max(abs(dc), abs(dr)) != radius:
+                    continue
+                nc, nr = c + dc, r + dr
+                if 0 <= nc < w and 0 <= nr < h and not blocked[nr, nc]:
+                    d2 = dc * dc + dr * dr
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = (nc, nr)
+    return best
+
+
 def astar(blocked, start, goal, extra_cost=None):
     """8-connected A* on a boolean grid with optional soft cost overlay."""
     h, w = blocked.shape
@@ -64,32 +91,49 @@ def astar(blocked, start, goal, extra_cost=None):
 
 
 def plan_path(start_xy, goal_xy, grid, resolution, origin_x, origin_y,
-              hard_r=4, soft_r=8):
+              hard_r=4, soft_r=8, goal_snap_radius=10):
     """
     A* with soft inflation.
+
+    If the goal cell falls inside an obstacle's hard zone (which happens when
+    a beacon sits at the score-cell center), we snap the goal to the closest
+    free cell within Chebyshev `goal_snap_radius` cells. We DO NOT unblock
+    around the goal — that previously carved a tunnel through the obstacle
+    and made the controller drive straight into it.
+
     Returns (waypoints, hard_r) or (None, None) on failure.
     """
     if grid is None:
         return None, None
     s = world_to_grid(start_xy[0], start_xy[1], origin_x, origin_y, resolution)
     g = world_to_grid(goal_xy[0], goal_xy[1], origin_x, origin_y, resolution)
-    blocked, extra = cost_field(grid, hard_r, soft_r)
-    unblock(blocked, s[0], s[1], 2)
-    unblock(blocked, g[0], g[1], 2)
-    cells = astar(blocked, s, g, extra_cost=extra)
-    if cells is None:
-        blocked2, _ = cost_field(grid, max(1, hard_r // 2), soft_r)
-        unblock(blocked2, s[0], s[1], 2)
-        unblock(blocked2, g[0], g[1], 2)
-        cells = astar(blocked2, s, g, extra_cost=extra)
-        if cells is None:
-            return None, None
-    pts = [grid_to_world(c, r, origin_x, origin_y, resolution)
-           for c, r in cells]
-    if len(pts) > 6:
-        step = max(1, len(pts) // 5)
-        ds = pts[::step]
-        if ds[-1] != pts[-1]:
-            ds.append(pts[-1])
-        pts = ds
-    return pts, hard_r
+
+    # Progressive fallback — keep a safety floor of 5 cells (25cm) inflation,
+    # which is the minimum that prevents the planner from carving a path
+    # straight up against an obstacle (robot radius 21cm).
+    h_seq = []
+    h = hard_r
+    while h >= 5:
+        h_seq.append(h)
+        h -= 1
+    if not h_seq or h_seq[-1] != 5:
+        h_seq.append(5)
+
+    for h_r in h_seq:
+        blocked, extra = cost_field(grid, h_r, soft_r)
+        unblock(blocked, s[0], s[1], 2)  # robot near a wall is OK to escape
+        g_eff = find_nearest_free(blocked, g[0], g[1], goal_snap_radius)
+        if g_eff is None:
+            continue
+        cells = astar(blocked, s, g_eff, extra_cost=extra)
+        if cells is not None:
+            pts = [grid_to_world(c, r, origin_x, origin_y, resolution)
+                   for c, r in cells]
+            if len(pts) > 6:
+                step = max(1, len(pts) // 5)
+                ds = pts[::step]
+                if ds[-1] != pts[-1]:
+                    ds.append(pts[-1])
+                pts = ds
+            return pts, h_r
+    return None, None
