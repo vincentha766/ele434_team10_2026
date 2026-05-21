@@ -97,6 +97,9 @@ def main(args=None):
     tf_buffer = tf2_ros.Buffer()
     tf2_ros.TransformListener(tf_buffer, node)
 
+    def now_sec():
+        return time.time()
+
     # ---- sensor state (replaces globals) ----
     state = {
         'odom_ready': False,
@@ -149,12 +152,13 @@ def main(args=None):
     V_MAX        = 0.26       # hw 标称速度
     W_MAX        = 1.82
     K_YAW        = 2.4
-    SCORE_TOL    = 0.45      # 拉宽到 cell 半宽附近, 容许障碍在中心时从 cell 边缘打卡
+    SCORE_TOL    = 0.29      # robot 中心进入 cell 边缘以内 (cell 半宽 0.5 - robot 半径 0.21 = 0.29) = robot 完全进 cell
     REACH_TOL    = 0.22
     MAX_RUN_T    = 240.0      # 放松时限, 优先零碰撞
 
-    HARD_R       = 7          # 35cm 硬禁区
-    SOFT_R       = 11         # 55cm 软膨胀
+    HARD_R       = 8          # 40cm beacon 硬禁区 (robot 21cm + 障碍 10cm + 9cm 跟踪余量)
+    HARD_R_WALL  = 6          # 30cm wall 硬禁区 (robot 边离 wall ~9cm, 留跟踪误差余量)
+    SOFT_R       = 12         # 60cm 软膨胀
     REPLAN_PERIOD = 1.0
 
     # 紧急刹停: 极近距离才触发, 比 robot 半径稍小, 不在窄角落误触发
@@ -176,11 +180,12 @@ def main(args=None):
         ( 0.5, -1.5), (-0.5, -1.5), (-1.5, -1.5),                # 8-10
         (-1.5, -0.5), (-1.5,  0.5),                              # 11-12
     ]
-    # 贪心最近策略: 每步选最近的"未打卡且未 deferred"格
-    # 不依赖 zigzag 预设 -> 适配任意 L 挡板布局变化
+    # 贪心 + 周长邻接偏好: 距离 + 0.4 * (|idx 差| mod 12) 综合最小
+    # 这样从已打卡 cell 出发倾向于走相邻 cell, 不跨场地折返
     scored = [False] * 12
     deferred = set()
     cur_idx = 0      # 临时, 第一帧会被替换为最近格
+    last_scored_idx = -1  # 上次打卡的 cell index (-1 = 还没打过)
     cur_stuck = 0
 
     cur_path     = None
@@ -192,9 +197,15 @@ def main(args=None):
     # 防 opportunistic 死循环: 每个 cell 上次被 defer 的时间, 冷却期内不重试
     last_defer_t = {}     # cell_idx -> time
     DEFER_COOLDOWN = 10.0
+    # REPLAN_FAIL 计数: 同 cell 连续失败 N 次 -> 这 cell 太险, defer (避免直线兜底撞)
+    replan_fail_count = {}   # cell_idx -> n
+    REPLAN_FAIL_DEFER = 5
     # 周期 dump SLAM 占据栅格 (诊断: 圆筒是否被 SLAM 看到 / cost_field 是什么样)
     MAP_DUMP_PERIOD = 10.0
     last_map_dump_t = 0.0
+    # BRAKE snapshot 限频: 一局最多存 5 份 lidar 完整快照, 不然每帧触发会爆磁盘
+    n_brake_snaps = 0
+    BRAKE_SNAP_MAX = 5
 
     # ---- 数据采集 / 调试日志 ----
     dbg = RunLogger(
@@ -203,8 +214,11 @@ def main(args=None):
             'x', 'y', 'yaw_deg',
             'cell', 'tgt_x', 'tgt_y',
             'lh_x', 'lh_y', 'yaw_err_deg', 'd_goal',
-            'v_cmd', 'w_cmd',
-            'd_front', 'd_fl', 'd_fr', 'd_min', 'd_min_deg',
+            # v_cmd/w_cmd 是 publish 出去的最终值; v_raw/w_raw 是纯追踪原始输出
+            # (escape/brake 之前). v_src ∈ {pp, yaw_hard, brake_front, brake_side, escape}.
+            'v_cmd', 'w_cmd', 'v_raw', 'w_raw', 'v_src',
+            # contact = 1 当 d_min < 0.18 (≈ 机器人半径 21cm - 3cm 余量), 用来 grep 撞击帧
+            'd_front', 'd_fl', 'd_fr', 'd_min', 'd_min_deg', 'contact',
             'path_len', 'in_escape',
             'scored', 'cur_stuck', 'deferred_n',
             'phase',
@@ -213,7 +227,7 @@ def main(args=None):
             'V_MAX': V_MAX, 'W_MAX': W_MAX, 'K_YAW': K_YAW,
             'SCORE_TOL': SCORE_TOL,
             'REACH_TOL': REACH_TOL, 'MAX_RUN_T': MAX_RUN_T,
-            'HARD_R': HARD_R, 'SOFT_R': SOFT_R,
+            'HARD_R': HARD_R, 'HARD_R_WALL': HARD_R_WALL, 'SOFT_R': SOFT_R,
             'REPLAN_PERIOD': REPLAN_PERIOD,
             'EMERG_FRONT': EMERG_FRONT, 'YAW_HARD': YAW_HARD,
             'STUCK_WINDOW': STUCK_WINDOW, 'STUCK_DIST': STUCK_DIST,
@@ -246,10 +260,11 @@ def main(args=None):
             pass
 
     # (D) WARMUP: 原地慢转 WARMUP_T 秒, 让 SLAM 把周围 4 个 L + 4 beacon 都扫到
-    node.get_logger().info(f"WARMUP: 原地转 {WARMUP_T}s 让 SLAM 建图...")
+    # 用 sim 时间, 跟 RTF 加速同步
+    node.get_logger().info(f"WARMUP: 原地转 {WARMUP_T}s (sim) 让 SLAM 建图...")
     dbg.event('WARMUP_START', f'duration={WARMUP_T}s')
-    warmup_t0 = time.time()
-    while rclpy.ok() and time.time() - warmup_t0 < WARMUP_T:
+    warmup_t0 = now_sec()
+    while rclpy.ok() and now_sec() - warmup_t0 < WARMUP_T:
         rclpy.spin_once(node, timeout_sec=0.05)
         publish_cmd(cmd_pub, node, 0.0, 1.6)   # 中等角速度自旋一圈半
     publish_cmd(cmd_pub, node, 0.0, 0.0)
@@ -258,7 +273,7 @@ def main(args=None):
               f'map_ready={state["map_ready"]}')
     node.get_logger().info("WARMUP 完成, 开始任务.")
 
-    start_time = time.time()
+    start_time = now_sec()
 
     try:
         while rclpy.ok():
@@ -282,7 +297,7 @@ def main(args=None):
             odom_y = state['odom_y']
             odom_yaw = state['odom_yaw']
             lidar_ranges = state['lidar_ranges']
-            now_t = time.time()
+            now_t = now_sec()
 
             # 周期 dump map_grid (.npy) + 元信息. SCORED 后强制 dump 一份.
             if (state['map_ready']
@@ -310,6 +325,7 @@ def main(args=None):
                         and abs(odom_x - cx) <= SCORE_TOL
                         and abs(odom_y - cy) <= SCORE_TOL):
                     scored[i] = True
+                    last_scored_idx = i
                     elapsed = now_t - start_time
                     node.get_logger().info(
                         f"[打卡 t={elapsed:5.1f}s] 格 {i + 1} "
@@ -334,14 +350,12 @@ def main(args=None):
                           f'scored={sum(scored)}/12')
                 break
 
-            # 贪心最近: 选最近的未打卡且未 deferred 的格
+            # 选下一个目标: distance + 周长邻接偏好 (避免跨场地折返)
             prev_idx = cur_idx
             unscored = [i for i in range(12) if not scored[i]]
             if unscored:
-                # 优先未 deferred 的; 全 deferred 才考虑 deferred (解封最近)
                 avail = [i for i in unscored if i not in deferred]
                 if not avail:
-                    # 全部 unscored 都已 deferred -> 解封最近
                     avail = unscored
                     nearest = min(avail, key=lambda i: math.hypot(
                         score_cells[i][0] - odom_x,
@@ -350,9 +364,19 @@ def main(args=None):
                         node.get_logger().info(
                             f"全 deferred, 解封最近格 {nearest+1} 重试.")
                         deferred.discard(nearest)
-                cur_idx = min(avail, key=lambda i: math.hypot(
-                    score_cells[i][0] - odom_x,
-                    score_cells[i][1] - odom_y))
+
+                def cell_cost(i):
+                    cx, cy = score_cells[i]
+                    d = math.hypot(cx - odom_x, cy - odom_y)
+                    # 周长邻接偏好: 已打卡过 cell 时, 倾向于 idx 相邻的下个 cell
+                    perim_pen = 0.0
+                    if last_scored_idx >= 0:
+                        # 12 cells 环形, 周长距离取最小
+                        di = abs(i - last_scored_idx)
+                        di = min(di, 12 - di)
+                        perim_pen = 0.5 * (di - 1)  # idx 距 1 (相邻) 0 penalty
+                    return d + perim_pen
+                cur_idx = min(avail, key=cell_cost)
 
             if cur_idx != prev_idx:
                 cur_path = None
@@ -374,16 +398,21 @@ def main(args=None):
                     (odom_x, odom_y), (target_x, target_y),
                     state['map_grid'], state['map_res'],
                     state['map_origin_x'], state['map_origin_y'],
-                    hard_r=HARD_R, soft_r=SOFT_R)
+                    hard_r=HARD_R, soft_r=SOFT_R, hard_r_wall=HARD_R_WALL)
                 if pp is None:
+                    # A* 找不到安全路径 -> 立即 defer 这 cell, 绝不直线兜底 (撞).
+                    # 若 cell 中心障碍/挡板紧贴外墙等几何死结, 跳过保零碰撞.
                     node.get_logger().warn(
-                        f"A* 失败 cell{cur_idx+1}, 直线兜底")
+                        f"A* 失败 cell{cur_idx+1} -> defer (不直线兜底防撞)")
                     dbg.event(
-                        'REPLAN_FAIL',
+                        'DEFER_BY_REPLAN_FAIL',
                         f'cell={cur_idx+1} from=({odom_x:+.2f},{odom_y:+.2f}) '
                         f'to=({target_x:+.1f},{target_y:+.1f})')
-                    cur_path = [(target_x, target_y)]
+                    deferred.add(cur_idx)
+                    last_defer_t[cur_idx] = now_t
+                    cur_path = None  # 下次 replan 选别的 cell
                 else:
+                    replan_fail_count[cur_idx] = 0  # 成功重置
                     cur_path = pp
                     dbg.event(
                         'REPLAN',
@@ -452,11 +481,14 @@ def main(args=None):
             # 路径跟踪: 大偏差只转不走, 否则 cos(yaw_err) 稳定弧线
             if abs(yaw_err) > YAW_HARD:
                 v = 0.0
+                v_src = 'yaw_hard'
             else:
                 v = V_MAX * math.cos(yaw_err)
+                v_src = 'pp'
             w = max(-W_MAX, min(W_MAX, K_YAW * yaw_err))
+            v_raw, w_raw = v, w   # 留底, 用于 trace 比对 BRAKE 是否改了 v
 
-            # 紧急刹停: 分段防撞.
+            # 紧急刹停: 分段防撞. 拆 front/side 两种, 分别记 v_src 和 BRAKE 事件.
             #   ±15° 前向 < 0.22m: 即将正撞 (机器人前向冲入障碍)
             #   ±15-45° 侧前 < 0.16m: 侧前贴擦, 仅极近时触发 (50cm 走廊不误触)
             has_scan = len(lidar_ranges) >= 36
@@ -464,9 +496,30 @@ def main(args=None):
                 d_front_emerg = sector_min(lidar_ranges, -15, 15)
                 d_left = sector_min(lidar_ranges, 15, 45)
                 d_right = sector_min(lidar_ranges, -45, -15)
-                if d_front_emerg < EMERG_FRONT or min(d_left, d_right) < 0.16:
+                if d_front_emerg < EMERG_FRONT:
                     v = 0.0
+                    v_src = 'brake_front'
                     cur_path = None  # 强制重规划
+                    dbg.event('BRAKE',
+                              f'front d_f={d_front_emerg:.3f} '
+                              f'cell={cur_idx+1} '
+                              f'pose=({odom_x:+.2f},{odom_y:+.2f})')
+                    if n_brake_snaps < BRAKE_SNAP_MAX:
+                        dbg.snapshot(
+                            f'brake_t{int(now_t-start_time):03d}_cell{cur_idx+1}_front',
+                            [f'# pose=({odom_x:+.3f},{odom_y:+.3f}) '
+                             f'yaw_deg={math.degrees(odom_yaw):+.2f} '
+                             f'd_front_emerg={d_front_emerg:.3f}']
+                            + [f'{i} {r:.3f}' for i, r in enumerate(lidar_ranges)])
+                        n_brake_snaps += 1
+                elif min(d_left, d_right) < 0.16:
+                    v = 0.0
+                    v_src = 'brake_side'
+                    cur_path = None
+                    dbg.event('BRAKE',
+                              f'side d_l={d_left:.3f} d_r={d_right:.3f} '
+                              f'cell={cur_idx+1} '
+                              f'pose=({odom_x:+.2f},{odom_y:+.2f})')
 
             publish_cmd(cmd_pub, node, v, w)
 
@@ -487,14 +540,17 @@ def main(args=None):
             else:
                 d_min = -1.0
                 d_min_deg = 0.0
+            # contact 帧: 比 18cm (机器人半径 21cm - 3cm 余量) 还近时认定为疑似撞击.
+            # 21cm 是机器人物理半径, < 18cm 一般是 lidar 看到障碍已经卡进机器人轮廓.
+            contact = 1 if (0 < d_min < 0.18) else 0
             dbg.trace(
                 x=odom_x, y=odom_y, yaw_deg=math.degrees(odom_yaw),
                 cell=cur_idx + 1, tgt_x=target_x, tgt_y=target_y,
                 lh_x=lh_x, lh_y=lh_y,
                 yaw_err_deg=math.degrees(yaw_err), d_goal=d_goal,
-                v_cmd=v, w_cmd=w,
+                v_cmd=v, w_cmd=w, v_raw=v_raw, w_raw=w_raw, v_src=v_src,
                 d_front=d_front, d_fl=d_fl, d_fr=d_fr,
-                d_min=d_min, d_min_deg=d_min_deg,
+                d_min=d_min, d_min_deg=d_min_deg, contact=contact,
                 path_len=(len(cur_path) if cur_path else 0),
                 in_escape=(now_t < escape_until),
                 scored=sum(scored),
@@ -525,13 +581,57 @@ def main(args=None):
                 'scored_total': sum(scored),
                 'scored_cells': ','.join(str(i + 1) for i, s in enumerate(scored) if s),
                 'deferred_cells': ','.join(str(i + 1) for i in sorted(deferred)),
-                'elapsed_s': f'{time.time() - start_time:.2f}',
+                'elapsed_s': f'{now_sec() - start_time:.2f}',
             })
             node.get_logger().info(f"调试日志写入: {dbg.dir}")
         except Exception:
             pass
+        # 保存最后一次 SLAM 占据栅格为 PGM + YAML (Nav2/ROS 标准格式)
+        try:
+            if state['map_grid'] is not None:
+                save_slam_map(
+                    state['map_grid'], state['map_res'],
+                    state['map_origin_x'], state['map_origin_y'],
+                    os.path.join(dbg.dir, 'final_map'))
+                node.get_logger().info(
+                    f"SLAM 地图已存: {dbg.dir}/final_map.pgm + .yaml")
+        except Exception as e:
+            node.get_logger().warn(f"保存 SLAM 地图失败: {e!r}")
         node.destroy_node()
         rclpy.shutdown()
+
+
+def save_slam_map(grid, resolution, origin_x, origin_y, out_prefix):
+    """Save occupancy grid as PGM (image) + YAML (metadata), Nav2/ROS 标准格式.
+
+    Grid 约定 (nav_msgs/OccupancyGrid):
+      -1 = unknown, 0 = free, 100 = occupied
+
+    PGM 约定 (黑=occupied):
+      0 = black, 254 = white, 205 = gray (unknown)
+    """
+    h, w = grid.shape
+    img = np.full((h, w), 205, dtype=np.uint8)  # default unknown=gray
+    img[grid == 0] = 254  # free=white
+    img[grid >= 65] = 0   # occupied=black (匹配 default occupied_thresh)
+    # PGM is bottom-up in nav2 convention but OccupancyGrid is bottom-up too,
+    # so we flip vertically (image origin is top-left, world origin is bottom-left).
+    img = np.flipud(img)
+    pgm_path = out_prefix + '.pgm'
+    yaml_path = out_prefix + '.yaml'
+    with open(pgm_path, 'wb') as f:
+        f.write(b'P5\n')
+        f.write(f'{w} {h}\n'.encode())
+        f.write(b'255\n')
+        f.write(img.tobytes())
+    pgm_basename = os.path.basename(pgm_path)
+    with open(yaml_path, 'w') as f:
+        f.write(f"image: {pgm_basename}\n")
+        f.write(f"resolution: {resolution}\n")
+        f.write(f"origin: [{origin_x}, {origin_y}, 0.0]\n")
+        f.write("negate: 0\n")
+        f.write("occupied_thresh: 0.65\n")
+        f.write("free_thresh: 0.196\n")
 
 
 if __name__ == '__main__':
