@@ -65,6 +65,7 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid
 import math
 import os
+import signal
 import time
 
 from ele434_team10_2026_modules.nav_math import (
@@ -90,9 +91,36 @@ def publish_cmd(pub, node, v, w):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # 关掉 rclpy 自己的 SIGINT 处理, 自己抓 Ctrl+C → 先发刹车再 shutdown.
+    # 原版默认 SIGINT 会立即销毁 context, finally 里 publish_cmd 因
+    # "publisher's context is invalid" 失败, 小车收不到停止命令.
+    rclpy.init(args=args, signal_handler_options=rclpy.signals.SignalHandlerOptions.NO)
     node = rclpy.create_node('astar_navigator')
     cmd_pub = node.create_publisher(TwistStamped, '/cmd_vel', 10)
+
+    # Ctrl+C 触发: 发刹车 → 等 publish 出去 → 抛 KeyboardInterrupt 让主循环退出.
+    stop_requested = {'v': False}
+
+    def _sigint_handler(signum, frame):
+        if stop_requested['v']:
+            return  # 避免重入
+        stop_requested['v'] = True
+        try:
+            cmd = TwistStamped()
+            cmd.header.stamp = node.get_clock().now().to_msg()
+            cmd.header.frame_id = 'base_link'
+            cmd.twist.linear.x = 0.0
+            cmd.twist.angular.z = 0.0
+            cmd_pub.publish(cmd)
+            # 让 rmw 把消息真正放到线上 (sim 也需要这一帧 spin)
+            for _ in range(5):
+                rclpy.spin_once(node, timeout_sec=0.02)
+                cmd_pub.publish(cmd)
+        except Exception:
+            pass
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _sigint_handler)
 
     tf_buffer = tf2_ros.Buffer()
     tf2_ros.TransformListener(tf_buffer, node)
