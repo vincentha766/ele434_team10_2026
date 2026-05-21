@@ -185,7 +185,8 @@ def main(args=None):
     MAX_RUN_T    = 240.0      # 放松时限, 优先零碰撞
 
     HARD_R       = 8          # 40cm beacon 硬禁区 (robot 21cm + 障碍 10cm + 9cm 跟踪余量)
-    HARD_R_WALL  = 6          # 30cm wall 硬禁区 (robot 边离 wall ~9cm, 留跟踪误差余量)
+    HARD_R_WALL  = 5          # 25cm wall 硬禁区 (robot 边离 wall 4cm, 允许 50cm 窄通道)
+    # 注: HARD_R_WALL=6 跟踪误差余量更大但 < 0.55m 缝过不去; 5 是窄通道/安全的平衡
     SOFT_R       = 12         # 60cm 软膨胀
     REPLAN_PERIOD = 1.0
 

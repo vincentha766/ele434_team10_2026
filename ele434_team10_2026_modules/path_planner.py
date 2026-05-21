@@ -117,12 +117,20 @@ def plan_path(start_xy, goal_xy, grid, resolution, origin_x, origin_y,
     if hard_r_wall is None:
         hard_r_wall = hard_r
 
-    # Fallback: 只降 wall 膨胀, beacon 膨胀绝不降. wall 底线 6 (30cm = robot 21cm
-    # + 9cm 跟踪余量). 低于此跟踪误差能让 robot 边进 wall 表面 → scrape.
-    # 找不到安全路径时返回 None → work.py defer 这 cell (绝不直线兜底防撞).
-    h_seq = [(hard_r, hard_r_wall)]
-    if hard_r_wall > 6:
-        h_seq.append((hard_r, 6))
+    # Fallback: 只降 wall 膨胀, beacon 膨胀绝不降.
+    #   Primary: hard_r_wall (e.g. 6 = 30cm, 9cm 跟踪余量) — 优先这个
+    #   Fallback 1: 5 (25cm, 4cm 余量) — 窄通道触发, 此时 detour_ratio 用
+    #     来判断是否真需要降级 (绕远 vs 贴墙)
+    # 找不到任何路径 → None → work.py defer cell.
+    h_seq = []
+    seen = set()
+    for hw in (hard_r_wall, 6, 5):
+        if hw > hard_r_wall:
+            continue
+        key = (hard_r, hw)
+        if key not in seen:
+            seen.add(key)
+            h_seq.append(key)
 
     # 直线距离参考
     euclid_cells = math.hypot(s[0] - g[0], s[1] - g[1])
