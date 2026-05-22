@@ -1,61 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# =========================================================================
-# 节点: astar_navigator
-#
-# 任务背景:
-#   4x4m 场地, 12 个 1x1m 得分格在外圈 (中央 2x2 是非得分区).
-#   场内有 4 个圆筒 beacon + 4 个 L 挡板 (位置随机, 数量类型固定).
-#   目标: 90s 内尽可能多走过得分格, 不撞挡板.
-#
-# 实测最终配置 (V_max=0.26, W_max=1.82, 0 碰撞):
-#   - 12/12 in ~98s walltime
-#   - RTF=1.0 时 sim 时间 ≈ walltime, 上实机预估 100s 量级
-#
-# ─────────────────────── 策略层级 ───────────────────────
-#
-# 全局: 贪心最近 cell 选目标
-#   - 每帧选: 未打卡 + 未 deferred 的 cell 中, 欧氏距离最近的
-#   - 不预设 zigzag 顺序 -> 适配 L 挡板任意布局
-#   - STUCK 3 次的 cell 进 deferred 集合, 一圈后再解封
-#
-# 全局规划: A* + 软膨胀代价场 (cost_field)
-#   - HARD_R 内 (25cm): 不可走 (硬禁区)
-#   - HARD_R..SOFT_R (25-45cm): 可走但 cost 渐增, 倾向远离障碍但不绕远
-#   - 渐进 fallback: 起点/终点恰好在硬禁区 -> 局部解封 2 格
-#   - REPLAN_PERIOD=1.0s 周期重规划, 适应实时建图
-#
-# 路径跟随: 纯追踪
-#   - LOOKAHEAD 0.20m 取路径上最近的前瞻点
-#   - cos(yaw_err) 调速度, K_YAW * yaw_err 调角速度
-#   - 偏差 > YAW_HARD 1.2rad 时只转不走
-#
-# 反应式安全层 (覆盖纯追踪输出):
-#   - SAFE_FRONT < 0.28m: 立即刹停 + 重规划 (撞前救援)
-#   - SLOW_FRONT < 0.50m: 按距离比例减速到 0.3*v
-#   - SAFE_SIDE < 0.22m (侧前 ±20-60°): v ×= 0.4 (L 挡板斜面常侧蹭)
-#
-# 兜底机制:
-#   - WARMUP 4s 启动自旋: 让 SLAM 在出发前看清 4 个 L + 4 beacon
-#                         (省 17s — 否则第一次过 L 时 A* 无图凭空规划)
-#   - STUCK 检测: 3s 内位移 < 8cm -> 后退 + 反向转 1s
-#   - DEFER: 同格 STUCK 3 次 -> 跳到下个最近, 一圈后回头
-#   - opportunistic 打卡: 进入任何 cell 0.29m 圈就记分, 路过即可
-#
-# ─────────────────────── 历史踩坑 ───────────────────────
-#
-# 试过但更慢/更危险的方案 (按时间顺序):
-#   1. 左墙跟随       6/12, NW 角后过冲乱套
-#   2. APF 势场法     0/12, 起步在 4 beacon 中心被斥力围困打转
-#   3. VFH histogram  6/12, L 挡板下慢传 (42s 走 1m)
-#   4. 硬编 bypass    2/12, 中转点选错就堵死, 障碍变了完全失效
-#   5. zigzag 预设序  9/12 → 12/12 (V=0.55), 11/12 (V=0.26 hw 限速)
-#   6. 二元膨胀 35cm  12/12, 但绕 L 远 (107s)
-#   7. 软膨胀 + zigzag 12/12 in 107s
-#   8. 软膨胀 + 贪心  12/12 in 98s   <-- 当前
-#
-# =========================================================================
 
 import rclpy
 import tf2_ros
@@ -67,19 +10,14 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 import math
 import os
 import signal
+import subprocess
 import time
 
-from ele434_team10_2026_modules.nav_math import (
-    wrap_to_pi, yaw_from_quaternion,
-)
-from ele434_team10_2026_modules.path_planner import plan_path
-from ele434_team10_2026_modules.motion_control import (
+from ele434_team10_2026_modules.core import (
+    wrap_to_pi, yaw_from_quaternion, plan_path,
     find_lookahead_point, pure_pursuit,
+    sector_min, apply_safety, RunLogger,
 )
-from ele434_team10_2026_modules.reactive_safety import (
-    sector_min, apply_safety,
-)
-from ele434_team10_2026_modules.debug_logger import RunLogger
 
 
 def publish_cmd(pub, node, v, w):
@@ -91,29 +29,23 @@ def publish_cmd(pub, node, v, w):
     pub.publish(cmd)
 
 
+# A* navigator: greedy nearest cell + soft-inflation A* + pure pursuit + reactive safety
 def main(args=None):
-    # 关掉 rclpy 自己的 SIGINT 处理, 自己抓 Ctrl+C → 先发刹车再 shutdown.
-    # 原版默认 SIGINT 会立即销毁 context, finally 里 publish_cmd 因
-    # "publisher's context is invalid" 失败, 小车收不到停止命令.
     rclpy.init(args=args, signal_handler_options=rclpy.signals.SignalHandlerOptions.NO)
     node = rclpy.create_node('astar_navigator')
     cmd_pub = node.create_publisher(TwistStamped, '/cmd_vel', 10)
 
-    # Ctrl+C 触发: 发刹车 → 等 publish 出去 → 抛 KeyboardInterrupt 让主循环退出.
     stop_requested = {'v': False}
 
     def _sigint_handler(signum, frame):
         if stop_requested['v']:
-            return  # 避免重入
+            return
         stop_requested['v'] = True
         try:
             cmd = TwistStamped()
             cmd.header.stamp = node.get_clock().now().to_msg()
             cmd.header.frame_id = 'base_link'
-            cmd.twist.linear.x = 0.0
-            cmd.twist.angular.z = 0.0
             cmd_pub.publish(cmd)
-            # 让 rmw 把消息真正放到线上 (sim 也需要这一帧 spin)
             for _ in range(5):
                 rclpy.spin_once(node, timeout_sec=0.02)
                 cmd_pub.publish(cmd)
@@ -126,7 +58,6 @@ def main(args=None):
     tf_buffer = tf2_ros.Buffer()
     tf2_ros.TransformListener(tf_buffer, node)
 
-    # ---- sensor state (replaces globals) ----
     state = {
         'odom_ready': False,
         'lidar_ready': False,
@@ -151,13 +82,9 @@ def main(args=None):
         state['odom_ready'] = True
 
     def scan_callback(msg):
-        cleaned = []
-        for r in msg.ranges:
-            if math.isnan(r) or math.isinf(r) or r < 0.05:
-                cleaned.append(3.5)
-            else:
-                cleaned.append(r)
-        state['lidar_ranges'] = cleaned
+        state['lidar_ranges'] = [
+            3.5 if (math.isnan(r) or math.isinf(r) or r < 0.05) else r
+            for r in msg.ranges]
         state['lidar_ready'] = True
 
     def map_callback(msg):
@@ -174,57 +101,24 @@ def main(args=None):
     node.create_subscription(LaserScan, '/scan', scan_callback, 10)
     node.create_subscription(OccupancyGrid, '/map', map_callback, 10)
 
-    # ----- 调参 -----
-    V_MAX        = 0.26       # hw 标称速度
-    W_MAX        = 1.82
-    K_YAW        = 2.4
-    YAW_HARD     = 1.2
-    SCORE_TOL    = 0.29
-    REACH_TOL    = 0.22
-    MAX_RUN_T    = 240.0      # 放松时限, 优先零碰撞
-
-    HARD_R       = 5          # 25cm 硬禁区 (robot 半径 21cm + 4cm)
-    SOFT_R       = 9          # 45cm 软膨胀 (这之内 cost 渐增, 但仍可走)
-    REPLAN_PERIOD = 1.0
-
-    # (C) 侧前方也保护; SAFE 触发刹停, SLOW 触发减速
-    SAFE_FRONT   = 0.28
-    SLOW_FRONT   = 0.50
-    SAFE_SIDE    = 0.23       # 侧前 ±20-60° 比这近就强减速
-
-    STUCK_WINDOW = 3.0        # 放宽 stuck 检测 (慢走时 5cm/3s 不算 stuck)
-    STUCK_DIST   = 0.08
-    ESCAPE_DUR   = 1.0
-    DEFER_STUCK  = 3          # 给更多机会
-
-    LOOKAHEAD    = 0.29
-
-    WARMUP_T     = 4.0        # 启动原地自旋 N 秒让 SLAM 建图
+    V_MAX = 0.26;  W_MAX = 1.82;  K_YAW = 2.4;  YAW_HARD = 1.2
+    SCORE_TOL = 0.29;  REACH_TOL = 0.22;  MAX_RUN_T = 240.0
+    HARD_R = 5;  SOFT_R = 9;  REPLAN_PERIOD = 1.0
+    SAFE_FRONT = 0.28;  SLOW_FRONT = 0.50;  SAFE_SIDE = 0.23
+    STUCK_WINDOW = 3.0;  STUCK_DIST = 0.08;  ESCAPE_DUR = 1.0;  DEFER_STUCK = 3
+    LOOKAHEAD = 0.29;  WARMUP_T = 4.0
 
     score_cells = [
-        (-1.5,  1.5), (-0.5,  1.5), ( 0.5,  1.5), ( 1.5,  1.5),  # 1-4
-        ( 1.5,  0.5), ( 1.5, -0.5), ( 1.5, -1.5),                # 5-7
-        ( 0.5, -1.5), (-0.5, -1.5), (-1.5, -1.5),                # 8-10
-        (-1.5, -0.5), (-1.5,  0.5),                              # 11-12
+        (-1.5, 1.5), (-0.5, 1.5), (0.5, 1.5), (1.5, 1.5),
+        (1.5, 0.5), (1.5, -0.5), (1.5, -1.5),
+        (0.5, -1.5), (-0.5, -1.5), (-1.5, -1.5),
+        (-1.5, -0.5), (-1.5, 0.5),
     ]
-    # 贪心最近策略: 每步选最近的"未打卡且未 deferred"格
-    # 不依赖 zigzag 预设 -> 适配任意 L 挡板布局变化
     scored = [False] * 12
     deferred = set()
-    cur_idx = 0      # 临时, 第一帧会被替换为最近格
-    cur_stuck = 0
-
-    cur_path     = None
-    last_replan_t = 0.0
-    pose_hist = []
-    escape_until = 0.0
-    escape_dir   = 1
-    last_status_t = 0.0
-    # 防 opportunistic 死循环: 每个 cell 上次被 defer 的时间, 冷却期内不重试
-    last_defer_t = {}     # cell_idx -> time
-    DEFER_COOLDOWN = 10.0
-
-    # ---- 数据采集 / 调试日志 ----
+    cur_idx = 0;  cur_stuck = 0
+    cur_path = None;  last_replan_t = 0.0
+    pose_hist = [];  escape_until = 0.0;  escape_dir = 1;  last_status_t = 0.0
     dbg = RunLogger(
         run_name='work',
         trace_fields=[
@@ -250,12 +144,11 @@ def main(args=None):
             'LOOKAHEAD': LOOKAHEAD, 'WARMUP_T': WARMUP_T,
         },
     )
-    node.get_logger().info(f"调试日志目录: {dbg.dir}")
+    node.get_logger().info(f"Log dir: {dbg.dir}")
     dbg.event('INIT', f'log_dir={dbg.dir}')
 
-    node.get_logger().info("A* 节点已启动, 等待传感器 + map + SLAM ...")
+    node.get_logger().info("A* node started, waiting for sensors + map + SLAM ...")
 
-    # 等 SLAM TF 报告靠近 (0,0)
     wait_t0 = time.time()
     while rclpy.ok() and time.time() - wait_t0 < 12.0:
         rclpy.spin_once(node, timeout_sec=0.05)
@@ -268,24 +161,23 @@ def main(args=None):
             tx, ty = t.transform.translation.x, t.transform.translation.y
             if math.hypot(tx, ty) < 0.4 and state['map_ready']:
                 node.get_logger().info(
-                    f"启动确认: pose=({tx:+.2f},{ty:+.2f}), "
+                    f"Ready: pose=({tx:+.2f},{ty:+.2f}), "
                     f"map={state['map_w']}x{state['map_h']}")
                 break
         except Exception:
             pass
 
-    # (D) WARMUP: 原地慢转 WARMUP_T 秒, 让 SLAM 把周围 4 个 L + 4 beacon 都扫到
-    node.get_logger().info(f"WARMUP: 原地转 {WARMUP_T}s 让 SLAM 建图...")
+    node.get_logger().info(f"WARMUP: spinning {WARMUP_T}s for SLAM ...")
     dbg.event('WARMUP_START', f'duration={WARMUP_T}s')
     warmup_t0 = time.time()
     while rclpy.ok() and time.time() - warmup_t0 < WARMUP_T:
         rclpy.spin_once(node, timeout_sec=0.05)
-        publish_cmd(cmd_pub, node, 0.0, 1.6)   # 中等角速度自旋一圈半
+        publish_cmd(cmd_pub, node, 0.0, 1.6)
     publish_cmd(cmd_pub, node, 0.0, 0.0)
     dbg.event('WARMUP_DONE',
               f'pose=({state["odom_x"]:+.2f},{state["odom_y"]:+.2f}) '
               f'map_ready={state["map_ready"]}')
-    node.get_logger().info("WARMUP 完成, 开始任务.")
+    node.get_logger().info("WARMUP done, starting task.")
 
     start_time = time.time()
 
@@ -313,7 +205,6 @@ def main(args=None):
             lidar_ranges = state['lidar_ranges']
             now_t = time.time()
 
-            # 机会式打卡
             for i, (cx, cy) in enumerate(score_cells):
                 if (not scored[i]
                         and abs(odom_x - cx) <= SCORE_TOL
@@ -321,43 +212,40 @@ def main(args=None):
                     scored[i] = True
                     elapsed = now_t - start_time
                     node.get_logger().info(
-                        f"[打卡 t={elapsed:5.1f}s] 格 {i + 1} "
+                        f"[SCORED t={elapsed:5.1f}s] cell {i + 1} "
                         f"({cx:+.1f},{cy:+.1f})  {sum(scored)}/12")
                     dbg.event(
                         'SCORED',
                         f'cell={i + 1} at=({cx:+.1f},{cy:+.1f}) '
                         f'elapsed={elapsed:.1f}s total={sum(scored)}/12')
                     if i == cur_idx:
-                        cur_path = None  # 强制重规划下一个
+                        cur_path = None
 
             if all(scored):
                 node.get_logger().info(
-                    f"12 格全覆盖 t={now_t-start_time:.1f}s, 停车.")
+                    f"All 12 cells scored t={now_t-start_time:.1f}s, stopping.")
                 dbg.event('ALL_DONE', f'elapsed={now_t-start_time:.1f}s')
                 break
             if now_t - start_time > MAX_RUN_T:
                 node.get_logger().warn(
-                    f"超时 90s, 已打卡 {sum(scored)}/12, 停车.")
+                    f"Timeout, scored {sum(scored)}/12, stopping.")
                 dbg.event('TIMEOUT',
                           f'elapsed={now_t-start_time:.1f}s '
                           f'scored={sum(scored)}/12')
                 break
 
-            # 贪心最近: 选最近的未打卡且未 deferred 的格
             prev_idx = cur_idx
             unscored = [i for i in range(12) if not scored[i]]
             if unscored:
-                # 优先未 deferred 的; 全 deferred 才考虑 deferred (解封最近)
                 avail = [i for i in unscored if i not in deferred]
                 if not avail:
-                    # 全部 unscored 都已 deferred -> 解封最近
                     avail = unscored
                     nearest = min(avail, key=lambda i: math.hypot(
                         score_cells[i][0] - odom_x,
                         score_cells[i][1] - odom_y))
                     if nearest in deferred:
                         node.get_logger().info(
-                            f"全 deferred, 解封最近格 {nearest+1} 重试.")
+                            f"All deferred, unblocking nearest cell {nearest+1}.")
                         deferred.discard(nearest)
                 cur_idx = min(avail, key=lambda i: math.hypot(
                     score_cells[i][0] - odom_x,
@@ -371,11 +259,9 @@ def main(args=None):
             target_x, target_y = score_cells[cur_idx]
             d_goal = math.hypot(target_x - odom_x, target_y - odom_y)
             if d_goal < REACH_TOL and not scored[cur_idx]:
-                # 已到附近但还没被打卡 (理论上 SCORE_TOL > REACH_TOL 不会), 强制 score
                 scored[cur_idx] = True
                 continue
 
-            # ---- 重规划 ----
             need_replan = (cur_path is None
                            or now_t - last_replan_t > REPLAN_PERIOD)
             if need_replan and state['map_ready']:
@@ -386,7 +272,7 @@ def main(args=None):
                     hard_r=HARD_R, soft_r=SOFT_R)
                 if pp is None:
                     node.get_logger().warn(
-                        f"A* 失败 cell{cur_idx+1}, 直线兜底")
+                        f"A* failed cell{cur_idx+1}, falling back to straight line")
                     dbg.event(
                         'REPLAN_FAIL',
                         f'cell={cur_idx+1} from=({odom_x:+.2f},{odom_y:+.2f}) '
@@ -399,7 +285,6 @@ def main(args=None):
                         f'cell={cur_idx+1} waypoints={len(pp)} rr={rr_used}')
                 last_replan_t = now_t
 
-            # 前瞻点 + yaw_err (stuck 检测需要 yaw_err)
             if cur_path is None or len(cur_path) == 0:
                 lh_x, lh_y = target_x, target_y
             else:
@@ -409,8 +294,6 @@ def main(args=None):
             target_yaw = math.atan2(lh_y - odom_y, lh_x - odom_x)
             yaw_err = wrap_to_pi(target_yaw - odom_yaw)
 
-            # ---- stuck (旋转期不算; 只在我们实际命令前进时积累 pose_hist) ----
-            # 注: yaw_err > YAW_HARD 时 v 会被设成 0, 那不是真 stuck
             if abs(yaw_err) <= YAW_HARD:
                 pose_hist.append((now_t, odom_x, odom_y))
                 pose_hist = [p for p in pose_hist
@@ -429,16 +312,15 @@ def main(args=None):
                     escape_dir = -escape_dir
                     cur_stuck += 1
                     pose_hist = []
-                    cur_path = None  # 重规划
+                    cur_path = None
                     node.get_logger().warn(
-                        f"[STUCK #{cur_stuck}] 后退{ESCAPE_DUR}s "
+                        f"[STUCK #{cur_stuck}] reversing {ESCAPE_DUR}s "
                         f"@({odom_x:+.2f},{odom_y:+.2f})")
                     dbg.event(
                         'STUCK',
                         f'cell={cur_idx+1} n={cur_stuck} '
                         f'pose=({odom_x:+.2f},{odom_y:+.2f}) '
                         f'yaw={math.degrees(odom_yaw):+.1f} d_t={d_t:.3f}')
-                    # 把 lidar + 最近路径快照下来 — 没现场的话这是事后唯一线索
                     if lidar_ranges:
                         dbg.snapshot(
                             f'stuck_cell{cur_idx+1}_n{cur_stuck}_lidar',
@@ -451,19 +333,16 @@ def main(args=None):
                             [f'{px:.3f} {py:.3f}' for px, py in cur_path])
                     if cur_stuck >= DEFER_STUCK:
                         node.get_logger().warn(
-                            f"[DEFER] 格 {cur_idx+1} STUCK {cur_stuck}x, 跳过.")
+                            f"[DEFER] cell {cur_idx+1} stuck {cur_stuck}x, skipping.")
                         dbg.event('DEFER', f'cell={cur_idx+1} after_stuck={cur_stuck}')
                         deferred.add(cur_idx)
-                        last_defer_t[cur_idx] = now_t
                         cur_stuck = 0
                     continue
 
-            # ---- 速度 ----
             v, w = pure_pursuit(
                 odom_x, odom_y, odom_yaw, cur_path, target_x, target_y,
                 LOOKAHEAD, V_MAX, W_MAX, K_YAW, YAW_HARD)
 
-            # 反应式刹车 + 减速
             v_pp, w_pp = v, w
             v, w, braked = apply_safety(
                 lidar_ranges, v, w,
@@ -478,7 +357,6 @@ def main(args=None):
 
             publish_cmd(cmd_pub, node, v, w)
 
-            # 全量 lidar 三向汇总 + 状态写入 CSV
             has_scan = len(lidar_ranges) >= 36
             d_front = sector_min(lidar_ranges, -20, 20) if has_scan else -1.0
             d_fl = sector_min(lidar_ranges, 20, 60) if has_scan else -1.0
@@ -499,7 +377,6 @@ def main(args=None):
                 phase='run',
             )
 
-            # 状态日志
             if now_t - last_status_t >= 1.0:
                 last_status_t = now_t
                 path_len = len(cur_path) if cur_path else 0
@@ -511,11 +388,25 @@ def main(args=None):
                     f"v={v:+.2f} w={w:+.2f} d_f={d_front:.2f}")
 
     except KeyboardInterrupt:
-        node.get_logger().info("中断, 停车.")
+        node.get_logger().info("Interrupted, stopping.")
         dbg.event('INTERRUPT')
     finally:
         publish_cmd(cmd_pub, node, 0.0, 0.0)
         time.sleep(0.1)
+        try:
+            map_dir = os.path.expanduser('~/ros2_ws/src/ele434_team10_2026/maps')
+            os.makedirs(map_dir, exist_ok=True)
+            map_path = os.path.join(map_dir, 'explore_map')
+            result = subprocess.run(
+                ['ros2', 'run', 'nav2_map_server', 'map_saver_cli',
+                 '-f', map_path, '--fmt', 'png'],
+                capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                node.get_logger().info(f"Map saved: {map_path}.png")
+            else:
+                node.get_logger().warn(f"Map save failed: {result.stderr.strip()}")
+        except Exception as e:
+            node.get_logger().warn(f"Map save error: {e}")
         try:
             dbg.close(summary={
                 'scored_total': sum(scored),
@@ -523,7 +414,7 @@ def main(args=None):
                 'deferred_cells': ','.join(str(i + 1) for i in sorted(deferred)),
                 'elapsed_s': f'{time.time() - start_time:.2f}',
             })
-            node.get_logger().info(f"调试日志写入: {dbg.dir}")
+            node.get_logger().info(f"Log saved: {dbg.dir}")
         except Exception:
             pass
         node.destroy_node()
